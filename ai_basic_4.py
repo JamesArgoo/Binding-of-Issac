@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-ai_basic_4.py —— 规则版 AI：清房进下一间 + A* 追击 + 墙感知躲弹幕
+ai_basic_4.py —— 规则版 AI：8 方向移动 + 4 方向射击（甩泪）
 
 与 ai_basic.py 的区别：
-  * **移动改为 4 方向**（上/下/左/右），避免斜向走位卡角，更贴合格子寻路
-  * 射击仍保留 8 方向（对角射击能打中斜向敌人）
+  * 移动：8 方向（与 ai_basic 相同，W+A 即左上 45°）
+  * 射击：**4 方向**（上/下/左/右），但泪弹会继承人物移动速度，
+    斜向命中靠"边移动边打"的矢量合成（甩泪弹）；
+    选射击方向时综合考虑了 泪速 + 人物移速，见 choose_aim4()
 
 行为：
   * 房间有敌人：追最近的敌人（A* 绕障碍）+ 打 + 躲敌方泪弹
@@ -67,12 +69,32 @@ def dir8(ax, ay):
 
 
 def dir4(ax, ay):
-    """把方向向量量化到 4 方向（取主轴）。移动用。"""
+    """把方向向量量化到 4 方向（取主轴）。射击方向用。"""
     if abs(ax) < 1e-6 and abs(ay) < 1e-6:
         return (0, 0)
     if abs(ax) >= abs(ay):
         return (1 if ax > 0 else -1, 0)
     return (0, 1 if ay > 0 else -1)
+
+
+def choose_aim4(desired, player_vel, tear_speed):
+    """在 4 个射击方向里，选"加上人物速度后"最接近 desired 的那个（甩泪）。
+
+    泪弹实际速度 ≈ 射击方向 × 泪速 + 人物移动速度，
+    所以斜向命中靠"边移动边打"的矢量合成（甩泪弹）。
+    """
+    best_dir, best_dot = (0, 0), -2.0
+    for d in DIRS4:
+        tvx = d[0] * tear_speed + player_vel[0]
+        tvy = d[1] * tear_speed + player_vel[1]
+        m = math.hypot(tvx, tvy)
+        if m < 1e-6:
+            continue
+        dot = (tvx / m) * desired[0] + (tvy / m) * desired[1]
+        if dot > best_dot:
+            best_dot = dot
+            best_dir = d
+    return best_dir
 
 
 def _ang_diff(a, b):
@@ -91,7 +113,7 @@ def cell_walkable(gx, gy, grid):
 def wall_steer(mx, my, gidx, grid):
     gx, gy = gidx % grid["w"], gidx // grid["w"]
     angle = math.atan2(my, mx)
-    ordered = sorted(DIRS4, key=lambda d: _ang_diff(math.atan2(d[1], d[0]), angle))
+    ordered = sorted(DIRS8, key=lambda d: _ang_diff(math.atan2(d[1], d[0]), angle))
     for dx, dy in ordered:
         if cell_walkable(gx + dx, gy + dy, grid):
             return dx, dy
@@ -153,7 +175,7 @@ def nearest_open_door_grid(state, grid):
 
 
 def _go_to_door(state, grid, last_door=None):
-    """房间清空时，走到最近的开门。返回 4 方向 (mx, my)。"""
+    """房间清空时，走到最近的开门。返回 8 方向 (mx, my)。"""
     p = get_player(state)
     if grid is None or p.get("grid_idx") is None:
         return (0, 0)
@@ -171,7 +193,7 @@ def _go_to_door(state, grid, last_door=None):
     path = astar(grid, p["grid_idx"], best["grid"])
     if path and len(path) >= 2:
         cur, nxt = path[0], path[1]
-        return dir4((nxt % w) - (cur % w), (nxt // w) - (cur // w))
+        return dir8((nxt % w) - (cur % w), (nxt // w) - (cur // w))
     return (0, 0)
 
 
@@ -220,7 +242,7 @@ def plan_move(state, grid, p, target, enemies, projectiles, debug=None):
     p_size = p.get("size", DEFAULT_SIZE)
     move_speed = max(p.get("move_speed", 2.5), 1e-3)  # 单位/帧
     K = LOOKAHEAD_FRAMES
-    candidates = list(DIRS4) + [(0, 0)]
+    candidates = list(DIRS8) + [(0, 0)]
     best_dir, best_score = (0, 0), -1e18
     dist_now = math.hypot(target["x"] - p["x"], target["y"] - p["y"]) if target is not None else 0.0
     results = []  # 每个候选方向的得分（调试可视化用）
@@ -286,33 +308,38 @@ def decide(state, grid, last_door=None, debug=None):
         return move[0], move[1], 0, 0
 
     # --- 战斗 ---
-    # 瞄准：预判敌人未来位置，但防止"过冲指反"
-    dx, dy = target["x"] - p["x"], target["y"] - p["y"]
-    dist = math.hypot(dx, dy)
-    dir_x, dir_y = norm(dx, dy)              # 直接朝敌人的方向
-    shot_speed = max(state["player"].get("shot_speed", 10.0), 1e-3)
-    lead_frames = min(dist / shot_speed, LEAD_MAX_FRAMES)
-    aim_x = dx + target["vx"] * lead_frames
-    aim_y = dy + target["vy"] * lead_frames
-    aim = norm(aim_x, aim_y)
-    # 预判方向若偏离"直接朝敌人"超过 90°（过冲会导致指反），退回直接瞄准
-    if aim[0] * dir_x + aim[1] * dir_y <= 0:
-        aim = (dir_x, dir_y)
-
-    # 移动：候选方向采样 + 前瞻模拟（综合所有子弹/敌人/墙，避免局部最优）
+    # 1) 移动：8 方向候选采样 + 前瞻模拟（综合所有子弹/敌人/墙，避免局部最优）
     projectiles = get_enemy_projectiles(state)
     move = plan_move(state, grid, p, target, enemies, projectiles, debug=debug)
     if grid is not None and p.get("grid_idx") is not None and move != (0, 0):
         move = wall_steer(move[0], move[1], p["grid_idx"], grid)
 
+    # 2) 期望的泪弹方向：朝目标预判点（带过冲保护）
+    dx, dy = target["x"] - p["x"], target["y"] - p["y"]
+    dist = math.hypot(dx, dy)
+    dir_x, dir_y = norm(dx, dy)              # 直接朝敌人的方向
+    shot_speed = max(state["player"].get("shot_speed", 10.0), 1e-3)
+    lead_frames = min(dist / shot_speed, LEAD_MAX_FRAMES)
+    desired_x = dx + target["vx"] * lead_frames
+    desired_y = dy + target["vy"] * lead_frames
+    desired = norm(desired_x, desired_y)
+    if desired[0] * dir_x + desired[1] * dir_y <= 0:
+        desired = (dir_x, dir_y)             # 过冲指反时退回直接瞄准
+
+    # 3) 4 方向射击 + 甩泪：泪弹会继承人物移动速度，
+    #    在 4 个射击方向里挑一个，使 (射击方向×泪速 + 人物速度) 最接近期望方向
+    move_speed = max(p.get("move_speed", 2.5), 1e-3)
+    player_vel = (move[0] * move_speed, move[1] * move_speed)
+    aim4 = choose_aim4(desired, player_vel, shot_speed)
+
     if debug is not None:
         debug["target"] = target
         debug["move_dir"] = move
-        debug["aim_dir"] = aim
-        debug["aim_point"] = (p["x"] + aim_x, p["y"] + aim_y)  # 预判瞄准点（世界坐标）
+        debug["aim_dir"] = aim4
+        debug["aim_point"] = (p["x"] + desired_x, p["y"] + desired_y)
+        debug["desired"] = desired
 
-    aim8 = dir8(aim[0], aim[1])
-    return move[0], move[1], aim8[0], aim8[1]
+    return move[0], move[1], aim4[0], aim4[1]
 
 
 def dirs_to_action(mx, my):
@@ -447,8 +474,15 @@ def render_debug(state, grid, dbg):
         axp, ayp = to_px(ap[0], ap[1])
         cv2.circle(canvas, (axp, ayp), 5, (0, 255, 255), 1)
 
+    # 期望泪弹方向（青线）：对比 4 向瞄准，能看出甩泪补偿
+    ds = dbg.get("desired")
+    if ds:
+        cv2.line(canvas, (px, py),
+                 (int(px + ds[0] * CELL_PX * 2.5), int(py + ds[1] * CELL_PX * 2.5)),
+                 (255, 255, 0), 1)
+
     # 图例
-    cv2.putText(canvas, "green=move yellow=aim red=target", (5, H - 6),
+    cv2.putText(canvas, "green=move yellow=aim cyan=desired", (5, H - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (210, 210, 210), 1)
     return canvas
 

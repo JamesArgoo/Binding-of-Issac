@@ -10,6 +10,7 @@ local HOST = "127.0.0.1"
 local PORT = 48532
 local SEND_EVERY = 2  -- 每 2 帧发一次（RL 决策约 30Hz，够了，减少带宽）
 local MAP_EVERY = 30
+local GRID_EVERY = 15  -- 每 15 帧刷新一次地形（实时反映炸开石头/便便后的变化）
 
 local sock = nil
 local frame = 0
@@ -195,9 +196,9 @@ local function build_state()
         state.doors = doors
     end
 
-    -- 房间变化时重新导出可行走网格（供 Python 做 A* 寻路）
+    -- 网格：房间变化时 + 每 GRID_EVERY 帧刷新（实时反映炸开石头/便便等地形变化）
     local room_index = level:GetCurrentRoomIndex()
-    if room_index ~= last_room_index then
+    if room_index ~= last_room_index or frame % GRID_EVERY == 0 then
         last_room_index = room_index
         local okg, g = pcall(build_grid, room)
         if okg then
