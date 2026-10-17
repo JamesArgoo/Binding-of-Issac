@@ -1,0 +1,321 @@
+# -*- coding: utf-8 -*-
+"""
+isaac_env.py —— 把"以撒 + Lua 桥接 + pyautogui"包装成 Gymnasium 强化学习环境
+
+设计：
+  观测：玩家(6) + 最近16个敌人(6*16) + 最近48个敌方泪(4*48) + 玩家周围7x7网格(49) + 房间(2)
+  动作：MultiDiscrete([9, 9]) —— 移动(8方向+不动) × 射击(8方向+不射)
+  奖励：
+    * 受伤：-5/点血
+    * 打中敌人：+0.2/点血
+    * 击杀：+10
+    * 清房：+50
+    * 死亡：-100（episode 结束）
+    * 每帧：-0.005（逼它别挂机）
+  重置：玩家死亡后，模组会自动 ExecuteCommand("restart") 重开，环境等待新局开始。
+
+注意：这是实时环境，step() 会 sleep 若干帧，训练速度受游戏帧率限制。
+"""
+import math
+import time
+
+import gymnasium as gym
+import numpy as np
+import pyautogui
+from gymnasium import spaces
+
+# 关键！pyautogui 默认每次调用后 sleep 0.1s，会让训练慢到 2 FPS，必须清零
+pyautogui.PAUSE = 0.0
+
+from isaac_bridge import (IsaacBridge, get_enemies, get_enemy_projectiles, get_player)
+
+# ---- 尺寸参数 ----
+MAX_ENEMIES = 16
+MAX_TEARS = 48
+GRID_WIN = 7  # 7x7 局部网格
+OBS_DIM = 6 + MAX_ENEMIES * 6 + MAX_TEARS * 4 + GRID_WIN * GRID_WIN + 2 + 4 * 3  # 357
+
+# 8 方向：0=右 1=右下 2=下 3=左下 4=左 5=左上 6=上 7=右上
+DIRS8 = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
+
+# 归一化尺度
+POS_SCALE = 500.0
+VEL_SCALE = 10.0
+HP_SCALE = 12.0
+ENEMY_HP_SCALE = 50.0
+
+
+def _clip(v, lo=-10.0, hi=10.0):
+    return max(lo, min(hi, v))
+
+
+class KeyController:
+    def __init__(self):
+        self._move = set()
+        self._shoot = set()
+
+    def _apply(self, current, want):
+        for k in current - want:
+            pyautogui.keyUp(k)
+        for k in want - current:
+            pyautogui.keyDown(k)
+        return want
+
+    def set_move(self, mx, my):
+        want = set()
+        if mx > 0:
+            want.add("d")
+        elif mx < 0:
+            want.add("a")
+        if my > 0:
+            want.add("s")
+        elif my < 0:
+            want.add("w")
+        self._move = self._apply(self._move, want)
+
+    def set_shoot(self, ax, ay):
+        want = set()
+        if ax > 0:
+            want.add("right")
+        elif ax < 0:
+            want.add("left")
+        if ay > 0:
+            want.add("down")
+        elif ay < 0:
+            want.add("up")
+        self._shoot = self._apply(self._shoot, want)
+
+    def release_all(self):
+        for k in list(self._move):
+            pyautogui.keyUp(k)
+        for k in list(self._shoot):
+            pyautogui.keyUp(k)
+        self._move.clear()
+        self._shoot.clear()
+
+
+def cell_walkable(gx, gy, grid):
+    if grid is None:
+        return False
+    if gx < 0 or gy < 0 or gx >= grid["w"] or gy >= grid["h"]:
+        return False
+    return grid["cells"][gy * grid["w"] + gx] == 1
+
+
+def build_obs(state, grid):
+    """把一帧状态压成固定长度观测向量。"""
+    obs = []
+    p = state["player"]
+    # 玩家
+    obs.append(_clip(p["x"] / POS_SCALE))
+    obs.append(_clip(p["y"] / POS_SCALE))
+    obs.append(_clip(p["vx"] / VEL_SCALE))
+    obs.append(_clip(p["vy"] / VEL_SCALE))
+    obs.append(_clip((p["hp"] + p["soul_hp"]) / HP_SCALE))
+    obs.append(1.0 if p["hp"] > 0 else 0.0)
+
+    # 敌人（按距离排序，取最近的 MAX_ENEMIES 个）
+    enemies = get_enemies(state)
+    enemies.sort(key=lambda e: (e["x"] - p["x"]) ** 2 + (e["y"] - p["y"]) ** 2)
+    for i in range(MAX_ENEMIES):
+        if i < len(enemies):
+            e = enemies[i]
+            obs.append(_clip((e["x"] - p["x"]) / POS_SCALE))
+            obs.append(_clip((e["y"] - p["y"]) / POS_SCALE))
+            obs.append(_clip(e["vx"] / VEL_SCALE))
+            obs.append(_clip(e["vy"] / VEL_SCALE))
+            obs.append(_clip(e["hp"] / ENEMY_HP_SCALE))
+            obs.append(1.0 if e["boss"] else 0.0)
+        else:
+            obs.extend([0.0] * 6)
+
+    # 子弹（泪/激光/刀/投射物 type 2/7/8/9，全部），确保弹幕能被观测到
+    tears = get_enemy_projectiles(state)
+    tears.sort(key=lambda t: (t["x"] - p["x"]) ** 2 + (t["y"] - p["y"]) ** 2)
+    for i in range(MAX_TEARS):
+        if i < len(tears):
+            t = tears[i]
+            obs.append(_clip((t["x"] - p["x"]) / POS_SCALE))
+            obs.append(_clip((t["y"] - p["y"]) / POS_SCALE))
+            obs.append(_clip(t["vx"] / VEL_SCALE))
+            obs.append(_clip(t["vy"] / VEL_SCALE))
+        else:
+            obs.extend([0.0] * 4)
+
+    # 玩家周围 7x7 可行走网格
+    if grid is not None and p.get("grid_idx") is not None:
+        w, h = grid["w"], grid["h"]
+        gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
+        r = GRID_WIN // 2
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                obs.append(1.0 if cell_walkable(gx + dx, gy + dy, grid) else 0.0)
+    else:
+        obs.extend([0.0] * (GRID_WIN * GRID_WIN))
+
+    # 房间
+    obs.append(_clip(state["room"]["enemies_alive"] / 20.0))
+    obs.append(1.0 if state["room"]["clear"] else 0.0)
+
+    # 门（4 个正方向：相对玩家的网格方向 + 是否打开）
+    doors = {d["slot"]: d for d in state.get("doors", [])}
+    if grid is not None and p.get("grid_idx") is not None:
+        w, h = grid["w"], grid["h"]
+        gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
+        for slot in range(4):
+            d = doors.get(slot)
+            if d is not None:
+                dgx, dgy = d["grid"] % w, d["grid"] // w
+                obs.append(_clip((dgx - gx) / w))
+                obs.append(_clip((dgy - gy) / h))
+                obs.append(1.0 if d["open"] else 0.0)
+            else:
+                obs.extend([0.0, 0.0, 0.0])
+    else:
+        obs.extend([0.0] * 12)
+
+    return np.array(obs, dtype=np.float32)
+
+
+class IsaacEnv(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(self, frame_skip=2):
+        super().__init__()
+        self.frame_skip = frame_skip
+        self.action_space = spaces.MultiDiscrete([9, 9])
+        self.observation_space = spaces.Box(-10.0, 10.0, shape=(OBS_DIM,), dtype=np.float32)
+
+        self.bridge = IsaacBridge()
+        self.bridge.start()
+        self.kc = KeyController()
+        self.grid = None
+
+        self.prev_hp = 0.0
+        self.prev_enemy_hp = {}
+        self.prev_clear = False
+        self.prev_room_index = None
+        self.last_state = None
+
+    # ---------- 工具 ----------
+    def _alive(self, s):
+        if not s or "player" not in s:
+            return False
+        p = s["player"]
+        return (p["hp"] + p["soul_hp"]) > 0
+
+    def _wait_alive(self, timeout=60.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            s = self.bridge.get_state()
+            if s and "grid" in s:
+                self.grid = s["grid"]
+            if self._alive(s):
+                return s
+            time.sleep(0.05)
+        return None
+
+    # ---------- Gym 接口 ----------
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.kc.release_all()
+        s = self._wait_alive()
+        if s is None:
+            # 兜底：返回全零观测，避免训练直接崩
+            return np.zeros(OBS_DIM, dtype=np.float32), {}
+
+        p = s["player"]
+        self.last_state = s
+        self.prev_hp = p["hp"] + p["soul_hp"]
+        self.prev_enemy_hp = {e["id"]: e["hp"] for e in get_enemies(s)}
+        self.prev_clear = s["room"]["clear"]
+        return build_obs(s, self.grid), {}
+
+    def step(self, action):
+        move_a, shoot_a = int(action[0]), int(action[1])
+        mx, my = DIRS8[move_a] if move_a < 8 else (0, 0)
+        ax, ay = DIRS8[shoot_a] if shoot_a < 8 else (0, 0)
+        self.kc.set_move(mx, my)
+        self.kc.set_shoot(ax, ay)
+
+        # 按住动作跑 frame_skip 帧
+        time.sleep(self.frame_skip / 60.0)
+
+        s = self.bridge.get_state()
+        self.last_state = s
+        if s and "grid" in s:
+            self.grid = s["grid"]
+
+        terminated = False
+        reward = 0.0
+        if s and "player" in s:
+            reward, terminated = self._reward(s, shoot_a)
+        else:
+            reward = 0.0
+
+        obs = build_obs(s, self.grid) if (s and "player" in s) else np.zeros(OBS_DIM, dtype=np.float32)
+
+        if terminated:
+            self.kc.release_all()
+
+        return obs, float(reward), bool(terminated), False, {}
+
+    def _reward(self, s, shoot_a=8):
+        p = s["player"]
+        total_hp = p["hp"] + p["soul_hp"]
+        room_idx = s["room"]["index"]
+        room_changed = (self.prev_room_index is not None and room_idx != self.prev_room_index)
+
+        reward = 0.0
+
+        # 受伤（红心+魂心减少）—— 换房间时也继续算（掉了血就是掉了）
+        dmg = self.prev_hp - total_hp
+        if dmg > 0:
+            reward -= dmg * 5.0
+
+        # 打中 / 击杀 —— 换房间时敌人列表全变，跳过（避免误判成击杀）
+        cur_enemy_hp = {e["id"]: e["hp"] for e in get_enemies(s)}
+        if not room_changed:
+            dealt = 0.0
+            for eid, hp in self.prev_enemy_hp.items():
+                if eid in cur_enemy_hp:
+                    d = hp - cur_enemy_hp[eid]
+                    if d > 0:
+                        dealt += d
+            reward += dealt * 0.2
+
+            cur_alive = {eid for eid, hp in cur_enemy_hp.items() if hp > 0}
+            for eid, hp in self.prev_enemy_hp.items():
+                if hp > 0 and eid not in cur_alive:
+                    reward += 10.0
+
+        # 清房
+        if not self.prev_clear and s["room"]["clear"]:
+            reward += 50.0
+
+        # 进入新房间（鼓励推进，而不是在清空房间里瞎逛）
+        if room_changed:
+            reward += 5.0
+
+        # 清房后还乱射：小惩罚（教它没事别射）
+        if s["room"]["clear"] and shoot_a != 8:
+            reward -= 0.01
+
+        # 每帧小惩罚
+        reward -= 0.005
+
+        # 死亡
+        terminated = total_hp <= 0
+        if terminated:
+            reward -= 100.0
+
+        # 更新上一帧
+        self.prev_hp = total_hp
+        self.prev_enemy_hp = cur_enemy_hp
+        self.prev_clear = s["room"]["clear"]
+        self.prev_room_index = room_idx
+        return reward, terminated
+
+    def close(self):
+        self.kc.release_all()
+        self.bridge.stop()
