@@ -95,20 +95,34 @@ local function build_map(level)
 end
 
 local function build_grid(room)
-    -- 导出房间可行走网格 + 世界坐标原点/格子尺寸
+    -- 导出房间网格：可行走标记 + 碰撞等级 + 实体类型 + 世界坐标原点/格子尺寸
     local w = room:GetGridWidth()
     local h = room:GetGridHeight()
-    local cells = {}
+    local cells, coll, ent = {}, {}, {}
     local n = w * h
     for i = 0, n - 1 do
-        cells[i + 1] = (room:GetGridCollision(i) == 0) and 1 or 0
+        local c = room:GetGridCollision(i)
+        cells[i + 1] = (c == 0) and 1 or 0
+        coll[i + 1] = c
+        ent[i + 1] = 0
     end
+    -- 实体类型（单独 pcall，失败不影响走格数据）
+    pcall(function()
+        for i = 0, n - 1 do
+            local ge = room:GetGridEntity(i)
+            if ge then
+                ent[i + 1] = ge:GetType()
+            end
+        end
+    end)
     local tl = room:GetTopLeftPos()
     local br = room:GetBottomRightPos()
     return {
         w = w,
         h = h,
         cells = cells,
+        coll = coll,
+        ent = ent,
         ox = tl.X,
         oy = tl.Y,
         tw = (br.X - tl.X) / w,
