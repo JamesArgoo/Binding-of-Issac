@@ -10,3 +10,5 @@ bc_data_human.npz是人类玩家游玩的数据记录，产生于record_human.py
 bc_train用来把人类玩家的游玩数据训练给AI，这个效果不佳
 
 isaac_bridge.py  diag.py仅用于测试，测试是否能够获取数据。
+
+两个有帮助的以撒的结合接口网址：https://cuerzor.github.io/IsaacDocs/rep/Options.html，https://moddingofisaac.com/docs/rep/enums/GridEntityType.html
