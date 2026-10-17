@@ -10,9 +10,12 @@ ai_basic.py —— 规则版 AI v3：清房进下一间 + A* 追击 + 墙感知�
 用法：游戏进对局保持前台 -> python ai_basic.py -> 5 秒内切回游戏。
 按 'p' 暂停/继续（需 pip install keyboard），Ctrl+C 退出。
 """
+import argparse
 import math
 import time
 
+import cv2
+import numpy as np
 import pyautogui
 
 from isaac_bridge import (IsaacBridge, get_enemies, get_enemy_projectiles,
@@ -198,7 +201,7 @@ def cell_walkable_world(wx, wy, grid):
     return grid["cells"][gy * grid["w"] + gx] == 1
 
 
-def plan_move(state, grid, p, target, enemies, projectiles):
+def plan_move(state, grid, p, target, enemies, projectiles, debug=None):
     """候选方向采样 + 前瞻模拟：选未来最安全的方向（替代力场求和，避免局部最优）。"""
     p_size = p.get("size", DEFAULT_SIZE)
     move_speed = max(p.get("move_speed", 2.5), 1e-3)  # 单位/帧
@@ -206,6 +209,7 @@ def plan_move(state, grid, p, target, enemies, projectiles):
     candidates = list(DIRS8) + [(0, 0)]
     best_dir, best_score = (0, 0), -1e18
     dist_now = math.hypot(target["x"] - p["x"], target["y"] - p["y"]) if target is not None else 0.0
+    results = []  # 每个候选方向的得分（调试可视化用）
 
     for d in candidates:
         score = 0.0
@@ -243,12 +247,15 @@ def plan_move(state, grid, p, target, enemies, projectiles):
         # 无威胁时轻微偏好原地，避免无意义漂移
         if d == (0, 0):
             score += 0.05
+        results.append((d, score))
         if score > best_score:
             best_dir, best_score = d, score
+    if debug is not None:
+        debug["candidates"] = results
     return best_dir
 
 
-def decide(state, grid, last_door=None):
+def decide(state, grid, last_door=None, debug=None):
     """返回 (移动x, 移动y, 射击x, 射击y)，均为 8 方向 {-1,0,1}。"""
     p = get_player(state)
     target, enemies = choose_target(state, p)
@@ -257,6 +264,11 @@ def decide(state, grid, last_door=None):
     # --- 房间清空 / 无敌人：去最近的开门 ---
     if room_clear or target is None:
         move = _go_to_door(state, grid, last_door)
+        if debug is not None:
+            debug["target"] = None
+            debug["candidates"] = []
+            debug["move_dir"] = move
+            debug["aim_dir"] = (0, 0)
         return move[0], move[1], 0, 0
 
     # --- 战斗 ---
@@ -275,9 +287,15 @@ def decide(state, grid, last_door=None):
 
     # 移动：候选方向采样 + 前瞻模拟（综合所有子弹/敌人/墙，避免局部最优）
     projectiles = get_enemy_projectiles(state)
-    move = plan_move(state, grid, p, target, enemies, projectiles)
+    move = plan_move(state, grid, p, target, enemies, projectiles, debug=debug)
     if grid is not None and p.get("grid_idx") is not None and move != (0, 0):
         move = wall_steer(move[0], move[1], p["grid_idx"], grid)
+
+    if debug is not None:
+        debug["target"] = target
+        debug["move_dir"] = move
+        debug["aim_dir"] = aim
+        debug["aim_point"] = (p["x"] + aim_x, p["y"] + aim_y)  # 预判瞄准点（世界坐标）
 
     aim8 = dir8(aim[0], aim[1])
     return move[0], move[1], aim8[0], aim8[1]
@@ -335,7 +353,97 @@ class KeyController:
         self._shoot.clear()
 
 
+CELL_PX = 26  # 调试窗口里每格像素
+
+
+def render_debug(state, grid, dbg):
+    """把 AI 的世界模型 + 决策画成一张图（用于调试观察）。"""
+    if grid is None or "ox" not in grid:
+        canvas = np.zeros((220, 460, 3), np.uint8)
+        cv2.putText(canvas, "no grid data (restart game?)", (10, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        return canvas
+
+    w, h = grid["w"], grid["h"]
+    cells = grid["cells"]
+    W, H = w * CELL_PX, h * CELL_PX
+    canvas = np.full((H, W, 3), 25, np.uint8)
+
+    # 地形：可走=深灰，不可走=亮灰
+    for gy in range(h):
+        for gx in range(w):
+            color = (65, 65, 65) if cells[gy * w + gx] == 1 else (150, 150, 150)
+            cv2.rectangle(canvas, (gx * CELL_PX, gy * CELL_PX),
+                          ((gx + 1) * CELL_PX - 1, (gy + 1) * CELL_PX - 1), color, -1)
+
+    ox, oy, tw, th = grid["ox"], grid["oy"], grid["tw"], grid["th"]
+
+    def to_px(x, y):
+        return int((x - ox) / tw * CELL_PX), int((y - oy) / th * CELL_PX)
+
+    p = get_player(state)
+    px, py = to_px(p["x"], p["y"])
+
+    # 候选方向打分热力：绿=好（安全/该走），红=差
+    cands = dbg.get("candidates") or []
+    if cands:
+        scores = [sc for _, sc in cands]
+        lo, hi = min(scores), max(scores)
+        rng = hi - lo if hi > lo else 1.0
+        for d, sc in cands:
+            t = (sc - lo) / rng
+            col = (0, int(255 * t), int(255 * (1 - t)))  # BGR：t=1→绿，t=0→红
+            ex = px + int(d[0] * CELL_PX * 1.6)
+            ey = py + int(d[1] * CELL_PX * 1.6)
+            cv2.line(canvas, (px, py), (ex, ey), col, 2)
+
+    # 敌人（红点）
+    for e in get_enemies(state):
+        ex, ey = to_px(e["x"], e["y"])
+        cv2.circle(canvas, (ex, ey), max(4, int(e.get("size", 10) / 40 * CELL_PX)), (0, 0, 255), -1)
+    # 敌方子弹（黄点）
+    for t in get_enemy_projectiles(state):
+        bx, by = to_px(t["x"], t["y"])
+        cv2.circle(canvas, (bx, by), 3, (0, 200, 255), -1)
+
+    # 选中的目标（红圈）
+    tgt = dbg.get("target")
+    if tgt:
+        tx, ty = to_px(tgt["x"], tgt["y"])
+        cv2.circle(canvas, (tx, ty), 12, (0, 0, 255), 2)
+
+    # 玩家（蓝点）
+    cv2.circle(canvas, (px, py), max(5, int(p.get("size", 10) / 40 * CELL_PX)), (255, 150, 0), -1)
+
+    # 移动方向箭头（绿）
+    mv = dbg.get("move_dir", (0, 0))
+    if mv != (0, 0):
+        cv2.arrowedLine(canvas, (px, py),
+                        (int(px + mv[0] * CELL_PX * 2), int(py + mv[1] * CELL_PX * 2)),
+                        (0, 255, 0), 3, tipLength=0.3)
+    # 瞄准方向箭头（黄）
+    ad = dbg.get("aim_dir", (0, 0))
+    if ad != (0, 0):
+        cv2.arrowedLine(canvas, (px, py),
+                        (int(px + ad[0] * CELL_PX * 2), int(py + ad[1] * CELL_PX * 2)),
+                        (0, 255, 255), 2, tipLength=0.3)
+    # 预判瞄准点（黄圈）
+    ap = dbg.get("aim_point")
+    if ap:
+        axp, ayp = to_px(ap[0], ap[1])
+        cv2.circle(canvas, (axp, ayp), 5, (0, 255, 255), 1)
+
+    # 图例
+    cv2.putText(canvas, "green=move yellow=aim red=target", (5, H - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (210, 210, 210), 1)
+    return canvas
+
+
 def main():
+    ap = argparse.ArgumentParser(description="规则版以撒 AI")
+    ap.add_argument("--debug", action="store_true", help="打开可视化调试窗口（看 AI 为什么这么决策）")
+    args = ap.parse_args()
+
     bridge = IsaacBridge()
     bridge.start()
     kc = KeyController()
@@ -349,6 +457,8 @@ def main():
     for i in range(5, 0, -1):
         print(f"  {i}...")
         time.sleep(1)
+    if args.debug:
+        print("调试窗口已打开（绿=移动 黄=瞄准 红=目标；候选方向绿好红差）")
 
     paused = False
     prev_room = None
@@ -376,16 +486,25 @@ def main():
             prev_room = room_idx
             prev_door = nearest_open_door_grid(s, grid)
 
-            mx, my, ax, ay = decide(s, grid, last_door)
+            dbg = {} if args.debug else None
+            mx, my, ax, ay = decide(s, grid, last_door, debug=dbg)
             kc.set_move(mx, my)
             kc.set_shoot(ax, ay)
+
+            if args.debug:
+                canvas = render_debug(s, grid, dbg)
+                cv2.imshow("AI Debug (q 退出)", canvas)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
             time.sleep(0.016)  # ~60Hz
     except KeyboardInterrupt:
         pass
     finally:
         kc.release_all()
         bridge.stop()
-        print("\n已退出，按键已全部松开")
+        if args.debug:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
