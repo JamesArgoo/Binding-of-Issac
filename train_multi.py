@@ -16,6 +16,7 @@ N 倍的经验采集速度。单实例不加速（Windows 忏悔做不到虚拟�
     python train_multi.py --launch 3 --load models/isaac_ppo_bc --steps 200000
 """
 import argparse
+import os
 import sys
 import threading
 import time
@@ -202,6 +203,12 @@ def main():
     ap.add_argument("--n-steps", type=int, default=1024,
                     help="PPO 每次更新收集多少步（越大 advantage 估计越稳）")
     ap.add_argument("--batch", type=int, default=256, help="PPO minibatch 大小")
+    ap.add_argument("--turbo", action="store_true",
+                    help="用 turbo 加速层启动实例（虚拟时钟+跳渲染，实测约 5 倍）")
+    ap.add_argument("--turbo-speed", type=float, default=20.0,
+                    help="turbo 时钟倍速（20 和 60 效果一样，CPU 才是瓶颈）")
+    ap.add_argument("--viewer", type=int, default=0,
+                    help="最后 N 个实例不开 turbo：正常速度+正常渲染，供人观看")
     ap.add_argument("--device", default="cpu",
                     help="MlpPolicy 用 cpu 反而更快，默认 cpu")
     ap.add_argument("--tb", default=None, help="tensorboard 日志目录（需要装 tensorboard）")
@@ -218,7 +225,20 @@ def main():
         print("\n==== 端口 ↔ 窗口 对号 ====")
         mgr.resolve_mapping()
     elif args.launch:
-        mgr = mi.InstanceManager(n=args.launch)
+        kw = {}
+        if args.turbo:
+            here = os.path.dirname(os.path.abspath(__file__))
+            kw = dict(
+                injector=os.path.join(here, "turbo", "turbo_inject.exe"),
+                dll=os.path.join(here, "turbo", "turbo_hook.dll"),
+                env_extra=dict(ISAAC_TURBO_SPEED=str(args.turbo_speed),
+                               ISAAC_TURBO_SKIP_PRESENT="1",
+                               ISAAC_TURBO_RENDER_EVERY="0"),
+                viewer_count=args.viewer,
+            )
+            print(f"turbo 开启：{args.turbo_speed}x + 跳过呈现；"
+                  f"其中 {args.viewer} 个实例正常渲染供观看")
+        mgr = mi.InstanceManager(n=args.launch, **kw)
         print(f"启动 {args.launch} 个实例（每个窗口出来后在任意窗口开局）...")
         try:
             mgr.launch_all(wait_runs=True, run_timeout=args.run_timeout)
