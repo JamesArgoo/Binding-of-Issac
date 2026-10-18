@@ -22,7 +22,8 @@ local cur_port = nil    -- 当前连接的端口，发给 Python 便于对账
 local bound_port = nil  -- 已绑定的端口：掉线后优先回到它，防止被别的实例的空闲端口抢走
 local connected_at = 0  -- 连上时的帧号：用来区分"刚连上就被踢"和"真的掉线"
 
-local AUTO_RESTART = true  -- 死亡后自动重开一局（RL 训练用）
+local AUTO_RESTART = false  -- 死亡后自动重开。单房间战斗训练由 Python 下发 restart/goto，
+                            -- 这里关掉避免和环境的 reset 打架。
 local was_dead = false
 
 -- 无人值守：新开的实例停在主菜单时，自己尝试把对局开起来
@@ -93,6 +94,33 @@ local function sock_send(s)
         port_cursor = (bound_port - BASE_PORT) % MAX_INSTANCES
     end
     return false
+end
+
+-- 接收 Python 下发的命令（restart / goto d.<id> / exec <控制台命令>）。
+-- 这是"单房间战斗训练"的关键：reset 时直接把玩家传送进有敌人的房间，
+-- 免得 AI 自己在大地图里乱走、半天遇不到敌人。
+local function poll_commands()
+    if sock == nil then
+        return
+    end
+    sock:settimeout(0)
+    while true do
+        local line = sock:receive("*l")
+        if line == nil then
+            break
+        end
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" then
+            if line == "restart" then
+                pcall(function() Isaac.ExecuteCommand("restart") end)
+            elseif line:sub(1, 5) == "goto " then
+                pcall(function() Isaac.ExecuteCommand("goto " .. line:sub(6)) end)
+            elseif line:sub(1, 5) == "exec " then
+                pcall(function() Isaac.ExecuteCommand(line:sub(6)) end)
+            end
+        end
+    end
+    sock:settimeout(0.5)
 end
 
 local function build_entities(room)
@@ -265,7 +293,10 @@ end
 function mod:onUpdate()
     frame = frame + 1
 
-    -- 死亡自动重开（RL 训练：让对局无限继续下去）
+    -- 先处理 Python 下发的命令（每帧都收，保证 reset 够快）
+    poll_commands()
+
+    -- 死亡自动重开（开关见 AUTO_RESTART；改由 Python 控制 reset 时可关掉）
     if AUTO_RESTART then
         local pl = Isaac.GetPlayer(0)
         local dead = (pl ~= nil and pl:IsDead())

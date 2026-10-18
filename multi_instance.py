@@ -182,13 +182,14 @@ class Win32KeyController:
 
 # ---------------- 多端口桥接 ----------------
 class PortChannel:
-    """一个端口上的一条游戏连接。"""
+    """一个端口上的一条游戏连接（双向：收状态 + 下发命令）。"""
 
     def __init__(self, port):
         self.port = port
         self.latest = None
         self.connected = False
         self._lock = threading.Lock()
+        self._conn = None
 
     def set(self, msg):
         with self._lock:
@@ -198,6 +199,29 @@ class PortChannel:
     def state(self):
         with self._lock:
             return self.latest
+
+    def attach(self, conn):
+        with self._lock:
+            self._conn = conn
+
+    def detach(self):
+        with self._lock:
+            self._conn = None
+
+    def send(self, text):
+        """往游戏端发一行命令：restart / goto d.12 / exec <控制台命令>。
+
+        模组每帧轮询一次 socket，所以发出去后下一帧就会执行。
+        """
+        with self._lock:
+            conn = self._conn
+        if conn is None:
+            return False
+        try:
+            conn.sendall((text.rstrip("\n") + "\n").encode("utf-8"))
+            return True
+        except OSError:
+            return False
 
 
 class MultiPortBridge:
@@ -254,6 +278,7 @@ class MultiPortBridge:
     def _read_loop(self, conn, ch):
         buf = b""
         conn.settimeout(1.0)
+        ch.attach(conn)
         try:
             while self._running:
                 try:
@@ -276,6 +301,7 @@ class MultiPortBridge:
                         continue
                     ch.set(msg)
         finally:
+            ch.detach()
             try:
                 conn.close()
             except OSError:
@@ -517,6 +543,10 @@ class ChannelAdapter:
 
     def get_state(self):
         return self.channel.state()
+
+    def send(self, text):
+        """下发一行命令给游戏（restart / goto d.12 / exec ...）。"""
+        return self.channel.send(text)
 
     def stop(self):
         # 生命周期由 InstanceManager 统一管理，这里不动
