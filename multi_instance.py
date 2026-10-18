@@ -212,11 +212,29 @@ class PortChannel:
         self.connected = False
         self._lock = threading.Lock()
         self._conn = None
+        # 条件变量：模组推来新状态时唤醒等待的 env 线程。
+        # 用它替代忙轮询 —— 忙轮询会抢光 GIL（实测把吞吐从 52 打到 16）。
+        self._cond = threading.Condition()
+        self._seq = 0
 
     def set(self, msg):
         with self._lock:
             self.latest = msg
             self.connected = True
+        with self._cond:
+            self._seq += 1
+            self._cond.notify_all()
+
+    def seq(self):
+        with self._cond:
+            return self._seq
+
+    def wait_new(self, after, timeout=0.1):
+        """阻塞到"有比 after 更新的状态到达"，最多等 timeout。返回当前 seq。"""
+        with self._cond:
+            if self._seq <= after:
+                self._cond.wait(timeout)
+            return self._seq
 
     def state(self):
         with self._lock:
@@ -608,6 +626,12 @@ class ChannelAdapter:
     def send(self, text):
         """下发一行命令给游戏（restart / goto d.12 / exec ...）。"""
         return self.channel.send(text)
+
+    def seq(self):
+        return self.channel.seq()
+
+    def wait_new(self, after, timeout=0.1):
+        return self.channel.wait_new(after, timeout)
 
     def stop(self):
         # 生命周期由 InstanceManager 统一管理，这里不动

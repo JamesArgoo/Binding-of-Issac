@@ -147,21 +147,27 @@ class CombatEnv(gym.Env):
         return None
 
     def _wait_frames(self, n, timeout=1.0):
-        """等游戏**逻辑帧**推进 n 帧，而不是按墙钟睡固定时间。
+        """等游戏**逻辑帧**推进 n 帧（而不是按墙钟睡固定时间）。
 
-        这是 turbo 加速能转化为吞吐的关键：固定 time.sleep(2/60) 会把决策频率
-        锁死在 ~30 次/秒，跟游戏实际跑多快无关；改成盯 frame 计数器后，
-        游戏快 5 倍，决策也就快 5 倍。
+        这是把 turbo 加速转成训练吞吐的关键：固定 time.sleep(2/60) 把决策频率
+        锁死在 ~30 次/秒，跟游戏跑多快无关；turbo 让游戏快 5 倍，决策也该快 5 倍。
+
+        等待用**条件变量**（模组推来新状态时唤醒），不能忙轮询 ——
+        实测 0.5ms 忙轮询会把 GIL 抢光，吞吐从 52 掉到 16。
         """
         s0 = self._state()
-        f0 = int(s0.get("frame", 0)) if s0 else 0
+        f0 = int(s0.get("frame", 0)) if (s0 and "frame" in s0) else 0
+        seq = self.bridge.seq() if hasattr(self.bridge, "seq") else 0
         t0 = time.time()
         s = s0
         while time.time() - t0 < timeout:
             s = self._state()
             if s and int(s.get("frame", 0)) - f0 >= n:
                 return s
-            time.sleep(0.0005)
+            if hasattr(self.bridge, "wait_new"):
+                seq = self.bridge.wait_new(seq, timeout=0.1)
+            else:
+                time.sleep(0.002)
         return s
 
     def _cmd(self, text):
@@ -289,11 +295,8 @@ class CombatEnv(gym.Env):
             self.kc.set_move(mx, my)
             self.kc.set_shoot(ax, ay)
 
-            # 固定按墙钟节流（--frame-skip 帧 @60fps）。
-            # 注：改成盯 frame 计数器的忙轮询实测更慢（0.5ms 轮询把 GIL 抢光了），
-            # 要真正吃满 turbo 的 5 倍，得用条件变量在状态到达时唤醒，见 README 待办。
-            time.sleep(self.frame_skip / 60.0)
-            s = self._state()
+            # 按游戏逻辑帧推进（不是墙钟）——turbo 下这一步会快约 5 倍
+            s = self._wait_frames(self.frame_skip)
             self.last_state = s
             if not s or "player" not in s:
                 break
