@@ -151,6 +151,8 @@ local function build_entities(room)
                 size = e.Size,               -- 碰撞体积（半径）
                 height = e.Height or 0,      -- 泪弹高度（Z），非泪弹为 0
                 coll = e.CollisionClass or 0,  -- 碰撞类别（EntityCollisionClass）
+                cdmg = e.CollisionDamage or 0, -- 接触伤害（>0 表示站上去会掉血：火堆等）
+                gcoll = e.GridCollisionClass or 0,
             }
         end
     end

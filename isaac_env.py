@@ -130,6 +130,49 @@ def normalize_grid(grid):
     return grid
 
 
+HAZARD_PAD = 28.3   # 危险判定半径的修正量，照 AIsaac abplus_obs._terrain_with_hazards
+
+
+def _hazard_cells(state, grid):
+    """带接触伤害的实体（火堆、火焰等）会伤到的格子集合。
+
+    AIsaac 的做法：cdmg > 0 的实体，凡是格心到它中心距离 <= size + 28.3 的格子都算危险。
+    没有这个，AI 完全看不见火堆，只能靠掉血后才知道疼。
+    """
+    if not grid:
+        return frozenset()
+    coll = grid.get("coll")
+    if not coll:
+        return frozenset()
+    tw = float(grid.get("tw", 40.0)) or 40.0
+    th = float(grid.get("th", 40.0)) or 40.0
+    ox = float(grid.get("ox", 0.0))
+    oy = float(grid.get("oy", 0.0))
+    w, h = grid["w"], grid["h"]
+    out = set()
+    for e in state.get("entities", []):
+        try:
+            cdmg = float(e.get("cdmg", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if cdmg <= 0 or e.get("type") == 1:      # 玩家自己不算
+            continue
+        r = float(e.get("size", 10.0) or 0) + HAZARD_PAD
+        r2 = r * r
+        ex, ey = e["x"], e["y"]
+        gx0 = max(0, int((ex - r - ox) / tw))
+        gx1 = min(w - 1, int((ex + r - ox) / tw) + 1)
+        gy0 = max(0, int((ey - r - oy) / th))
+        gy1 = min(h - 1, int((ey + r - oy) / th) + 1)
+        for gy in range(gy0, gy1 + 1):
+            cy = oy + (gy + 0.5) * th
+            for gx in range(gx0, gx1 + 1):
+                cx = ox + (gx + 0.5) * tw
+                if (cx - ex) ** 2 + (cy - ey) ** 2 <= r2:
+                    out.add(gy * w + gx)
+    return out
+
+
 def _room_scale(grid):
     """房间在世界坐标里的宽、高、左上角（借鉴 AIsaac：按房间尺寸归一化，而不是固定 /500）。"""
     if grid is not None and "ox" in grid and "tw" in grid and "th" in grid:
@@ -190,14 +233,21 @@ def build_obs(state, grid):
         else:
             obs.extend([0.0] * 5)
 
-    # 玩家周围 7x7 可行走网格
+    # 玩家周围 7x7 网格：0=走不了 / 0.5=能走但危险(火堆等) / 1=能走且安全
     if grid is not None and p.get("grid_idx") is not None:
         w, h = grid["w"], grid["h"]
         gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
         r = GRID_WIN // 2
+        haz = _hazard_cells(state, grid)
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
-                obs.append(1.0 if cell_walkable(gx + dx, gy + dy, grid) else 0.0)
+                cx, cy = gx + dx, gy + dy
+                if not cell_walkable(cx, cy, grid):
+                    obs.append(0.0)
+                elif cy * w + cx in haz:
+                    obs.append(0.5)      # 能走，但站上去会掉血
+                else:
+                    obs.append(1.0)
     else:
         obs.extend([0.0] * (GRID_WIN * GRID_WIN))
 
