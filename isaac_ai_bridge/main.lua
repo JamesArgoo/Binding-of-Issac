@@ -147,7 +147,9 @@ local function build_grid(room)
     local n = w * h
     for i = 0, n - 1 do
         local c = room:GetGridCollision(i)
-        cells[i + 1] = (c == 0) and 1 or 0
+        -- 可走 = 空地(0) 或 墙但玩家可过(5)。门就是 coll=5，
+        -- 只认 0 的话 A* 永远到不了门，AI 会被锁死在房间里。
+        cells[i + 1] = (c == 0 or c == 5) and 1 or 0
         coll[i + 1] = c
         ent[i + 1] = 0
     end

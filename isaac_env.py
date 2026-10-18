@@ -110,6 +110,26 @@ def cell_walkable(gx, gy, grid):
     return grid["cells"][gy * grid["w"] + gx] == 1
 
 
+# 玩家能不能走：0=空地；5=WALL_EXCEPT_PLAYER（门就是这一类，玩家能穿过去）
+WALKABLE_COLL = (0, 5)
+
+
+def normalize_grid(grid):
+    """按"玩家能不能走"重算 grid["cells"]。
+
+    模组里 cells 只把碰撞类别 0 当可走，可门是 coll=5（WALL_EXCEPT_PLAYER）。
+    结果 A* 永远到不了门 —— 规则AI被锁死在房间里出不去，这曾是最致命的 bug。
+    这里直接用 coll 重算：0 和 5 都算可走，坑(1)/物体(2)/实心(3)/真墙(4)都不算。
+    """
+    if not grid:
+        return grid
+    coll = grid.get("coll")
+    if not coll:
+        return grid
+    grid["cells"] = [1 if c in WALKABLE_COLL else 0 for c in coll]
+    return grid
+
+
 def _room_scale(grid):
     """房间在世界坐标里的宽、高、左上角（借鉴 AIsaac：按房间尺寸归一化，而不是固定 /500）。"""
     if grid is not None and "ox" in grid and "tw" in grid and "th" in grid:
@@ -245,7 +265,7 @@ class IsaacEnv(gym.Env):
         while time.time() - t0 < timeout:
             s = self.bridge.get_state()
             if s and "grid" in s:
-                self.grid = s["grid"]
+                self.grid = normalize_grid(s["grid"])
             if self._alive(s):
                 return s
             time.sleep(0.05)
@@ -281,7 +301,7 @@ class IsaacEnv(gym.Env):
         s = self.bridge.get_state()
         self.last_state = s
         if s and "grid" in s:
-            self.grid = s["grid"]
+            self.grid = normalize_grid(s["grid"])
 
         terminated = False
         reward = 0.0
