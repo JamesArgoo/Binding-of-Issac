@@ -20,6 +20,7 @@
 为什么不用"让 AI 自己走整层楼"的旧思路：实测 AI 会在两个房间之间无限来回弹，
 录了几分钟才走 2 个房间，永远遇不到敌人。AIsaac 直接传送进战斗房间规避了这个问题。
 """
+import math
 import time
 from collections import deque
 
@@ -35,16 +36,41 @@ DIRS8 = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
 SHOOT_DIRS = [(0, 0), (0, -1), (1, 0), (0, 1), (-1, 0)]   # 0=不射 1=上 2=右 3=下 4=左
 N_MOVE, N_SHOOT = 9, 5
 
-# ---- 奖励常数（照 AIsaac CombatHitRate 的比例）----
+# ---- 奖励常数（照 AIsaac CombatHitRateHurt / CombatHp）----
 HIT_HP = 5.0            # 每造成 5 点伤害 +1
 KILL = 0.25             # 每杀一个 +0.25
 COST_HIT = 0.5          # 命中率=1 时每秒的时间代价
 COST_MISS = 2.0         # 命中率=0 时每秒的时间代价
-DEATH = 5.0             # 死亡
 CLEAR = 40.0            # 清房（AIsaac ROOM_POINTS['normal']=40）
+DEATH = 5.0             # 死亡固定惩罚
+ALIGN = 0.2             # 对齐势权重（AIsaac HRW align=0.2）
+GAMMA = 0.99            # 势函数折扣，必须和 PPO 的 gamma 一致
+D_OPT = 150.0           # 理想射击距离（像素）：太近会被撞，太远打不着
+CELL = 40.0             # 一格 40 世界单位（AIsaac 的 CELL）
 SCALE = 0.1             # 整体缩放
 FPS = 30.0              # 决策频率（frame_skip=2 对应 30Hz）
 RATE_WINDOW = 45        # 命中率统计窗口（步）
+HP_FULL = 6.0           # 3 颗红心 = 6 个半心
+
+
+def _curve(x):
+    return (x + 1.0 - (1.0 - x) ** 4) / 2.0
+
+
+# 血量权重：让"丢最后一个半心"的代价约为丢第一个的十几倍
+HP_WEIGHT = 1.0 / (_curve(1.0) - _curve((HP_FULL - 1) / HP_FULL))
+
+
+def health_value(h):
+    """血量价值：凹形曲线，越接近死亡每一滴血越贵（AIsaac 的做法）。
+
+    直接用固定"每点血扣 X"会鼓励 AI 拿血硬换伤害；
+    凹形曲线让它在残血时格外小心，这才像人在玩。
+    """
+    h = max(0.0, float(h))
+    if h >= HP_FULL:
+        return HP_WEIGHT + (h - HP_FULL)
+    return HP_WEIGHT * _curve(h / HP_FULL)
 
 
 def time_price(rate):
@@ -63,16 +89,19 @@ class CombatEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, bridge, controller, variants=(12, 13, 14),
-                 frame_skip=2, max_steps=900, seed=None):
+                 frame_skip=2, max_steps=None, seed=None, chunk=1):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
         self.variants = list(variants) or [12]
         self.frame_skip = frame_skip
-        self.max_steps = max_steps
+        # action chunking（借鉴 ACT）：一次决策输出连续 chunk 组动作，
+        # 缩短有效决策步数 -> PPO 信用分配更容易、动作更平滑。chunk=1 就是每次一步。
+        self.chunk = max(1, int(chunk))
+        self.max_steps = int(max_steps) if max_steps else max(50, 900 // self.chunk)
         self.rng = np.random.default_rng(seed)
 
-        self.action_space = spaces.MultiDiscrete([N_MOVE, N_SHOOT])
+        self.action_space = spaces.MultiDiscrete([N_MOVE, N_SHOOT] * self.chunk)
         self.observation_space = spaces.Box(-10.0, 10.0, shape=(OBS_DIM,), dtype=np.float32)
 
         self.grid = None
@@ -83,11 +112,15 @@ class CombatEnv(gym.Env):
         self._prev_alive = set()
         self._prev_clear = False
         self._prev_room = None
+        self._prev_hp = HP_FULL
+        self._prev_phi = 0.0
+        self._started_clear = False
         self._seen_tears = set()
         self._rate_window = deque(maxlen=RATE_WINDOW)
         self._ep_dealt = 0.0
         self._ep_fired = 0.0
         self._ep_clear = 0
+        self._ep_hurt = 0.0
 
     # ---------------- 工具 ----------------
     def _state(self):
@@ -200,38 +233,66 @@ class CombatEnv(gym.Env):
         self._ep_dealt = 0.0
         self._ep_fired = 0.0
         self._ep_clear = 0
+        self._ep_hurt = 0.0
+
+        # 血量与对齐势的初值（势函数必须从当前状态起算，否则第一步会凭空多出一笔奖励）
+        pp = s.get("player", {}) if s else {}
+        self._prev_hp = float(pp.get("hp", 0) or 0) + float(pp.get("soul_hp", 0) or 0)
+        enemies0 = get_enemies(s) if (s and "player" in s) else []
+        if enemies0:
+            d0 = min(math.hypot(e["x"] - pp["x"], e["y"] - pp["y"]) for e in enemies0)
+            self._prev_phi = -ALIGN * abs(d0 - D_OPT) / CELL
+        else:
+            self._prev_phi = 0.0
 
         if "player" not in s:
             return np.zeros(OBS_DIM, dtype=np.float32), {}
         return build_obs(s, self.grid), {"variant": variant, "room": self._prev_room}
 
     def step(self, action):
-        move_a, shoot_a = int(action[0]), int(action[1])
-        mx, my = DIRS8[move_a] if move_a < 8 else (0, 0)
-        ax, ay = SHOOT_DIRS[shoot_a] if shoot_a < len(SHOOT_DIRS) else (0, 0)
-        self.kc.set_move(mx, my)
-        self.kc.set_shoot(ax, ay)
+        """一次决策输出 chunk 组动作（借鉴 ACT 的 action chunking）。
 
-        time.sleep(self.frame_skip / 60.0)
+        每组动作执行 frame_skip 帧，中途一旦结束就提前退出。
+        """
+        a = [int(x) for x in np.asarray(action).ravel()]
+        total_r = 0.0
+        terminated = False
+        info = {}
+        s = None
+
+        for k in range(self.chunk):
+            move_a = a[2 * k] if 2 * k < len(a) else 8
+            shoot_a = a[2 * k + 1] if 2 * k + 1 < len(a) else 0
+            mx, my = DIRS8[move_a] if move_a < 8 else (0, 0)
+            ax, ay = SHOOT_DIRS[shoot_a] if shoot_a < len(SHOOT_DIRS) else (0, 0)
+            self.kc.set_move(mx, my)
+            self.kc.set_shoot(ax, ay)
+
+            time.sleep(self.frame_skip / 60.0)
+            s = self._state()
+            self.last_state = s
+            if not s or "player" not in s:
+                break
+
+            r, term, info = self._reward(s)
+            total_r += r
+            if term:
+                terminated = True
+                break
+
         self.steps += 1
-
-        s = self._state()
-        self.last_state = s
-
-        if not s or "player" not in s:
-            return np.zeros(OBS_DIM, dtype=np.float32), 0.0, False, False, {}
-
-        reward, terminated, info = self._reward(s)
-        obs = build_obs(s, self.grid)
+        obs = (build_obs(s, self.grid) if (s and "player" in s)
+               else np.zeros(OBS_DIM, dtype=np.float32))
 
         truncated = self.steps >= self.max_steps
         if terminated or truncated:
             self.kc.release_all()
-        return obs, float(reward), bool(terminated), bool(truncated), info
+        return obs, float(total_r), bool(terminated), bool(truncated), info
 
     def _reward(self, s):
         p = s["player"]
         cur_hp, cur_alive = self._scan_enemies(s)
+        hp_now = float(p["hp"]) + float(p["soul_hp"])
 
         # ---- 伤害（照 AIsaac：lineage_damage 的差值）----
         dealt = 0.0
@@ -255,6 +316,26 @@ class CombatEnv(gym.Env):
         r += kills * KILL
         r -= time_price(rate) * (self.frame_skip / 60.0)
 
+        # ---- 受伤：凹形血量曲线，越接近死亡掉血越贵 ----
+        #     之前照抄的 hit-rate 配置里压根没有这一项（那是"玩家无敌"的实验配置），
+        #     所以 AI 完全没有躲怪的动机，会直接往怪身上撞。
+        if hp_now < self._prev_hp:
+            hurt = health_value(self._prev_hp) - health_value(hp_now)
+            r -= hurt
+            self._ep_hurt += hurt
+
+        # ---- 对齐势（potential-based，不改变结果排序）----
+        #     Φ = -ALIGN * |d - D_OPT| / CELL：鼓励停在"刚好能打到敌人"的距离，
+        #     太近会被撞、太远打不着。势函数形式保证不会扭曲最终收益排序。
+        enemies_all = get_enemies(s)
+        if enemies_all:
+            d = min(math.hypot(e["x"] - p["x"], e["y"] - p["y"]) for e in enemies_all)
+            phi = -ALIGN * abs(d - D_OPT) / CELL
+        else:
+            phi = 0.0
+        r += GAMMA * phi - self._prev_phi
+        self._prev_phi = phi
+
         # ---- 清房 ----
         room = s.get("room", {})
         cleared = bool(room.get("clear"))
@@ -262,10 +343,11 @@ class CombatEnv(gym.Env):
             r += CLEAR
             self._ep_clear += 1
 
-        # ---- 死亡 ----
-        dead = (p["hp"] + p["soul_hp"]) <= 0
+        # ---- 死亡：固定惩罚 + 罚掉剩余时间（早死不该省下时间成本）----
+        dead = hp_now <= 0
         if dead:
-            r -= DEATH
+            remaining_s = max(0.0, (self.max_steps - self.steps) / FPS)
+            r -= DEATH + COST_MISS * min(remaining_s, 30.0)
 
         # 起点就已清空时不把"clear"当终止条件，避免 reset 死循环
         terminated = bool(dead or (cleared and not self._started_clear))
@@ -273,11 +355,13 @@ class CombatEnv(gym.Env):
         info = {
             "dealt": dealt, "kills": kills, "fired": fired,
             "hit_rate": rate, "clear": cleared, "dead": dead,
-            "ep_dealt": self._ep_dealt, "ep_fired": self._ep_fired,
+            "hurt": self._ep_hurt, "ep_dealt": self._ep_dealt,
+            "ep_fired": self._ep_fired,
         }
 
         self._prev_enemy_hp, self._prev_alive = cur_hp, cur_alive
         self._prev_clear = cleared
+        self._prev_hp = hp_now
         return r * SCALE, terminated, info
 
     def close(self):

@@ -148,7 +148,7 @@ def load_variants(path, min_enemies=None, max_enemies=None):
 
 
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
-               min_enemies=None, max_enemies=None):
+               min_enemies=None, max_enemies=None, chunk=1):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -160,7 +160,7 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         rng = ""
         if min_enemies is not None or max_enemies is not None:
             rng = f"（敌人数 {min_enemies or 0}~{max_enemies or '∞'} 的课程）"
-        print(f"单房间战斗环境：{len(variants)} 个可用房间 variant{rng}")
+        print(f"单房间战斗环境：{len(variants)} 个可用房间 variant{rng}，chunk={chunk}")
     else:
         from isaac_env import IsaacEnv
 
@@ -170,7 +170,8 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         adapter = mi.ChannelAdapter(ch)
         if combat:
             envs.append(CombatEnv(adapter, inst.controller,
-                                  variants=variants, frame_skip=frame_skip))
+                                  variants=variants, frame_skip=frame_skip,
+                                  chunk=chunk))
         else:
             envs.append(IsaacEnv(frame_skip=frame_skip, bridge=adapter,
                                  controller=inst.controller))
@@ -196,6 +197,11 @@ def main():
                     help="课程学习：只练敌人数量 >= N 的房间")
     ap.add_argument("--max-enemies", type=int, default=None,
                     help="课程学习：只练敌人数量 <= N 的房间（先易后难）")
+    ap.add_argument("--chunk", type=int, default=1,
+                    help="action chunking：一次决策输出连续 N 组动作（借鉴 ACT，建议 2~4）")
+    ap.add_argument("--n-steps", type=int, default=1024,
+                    help="PPO 每次更新收集多少步（越大 advantage 估计越稳）")
+    ap.add_argument("--batch", type=int, default=256, help="PPO minibatch 大小")
     ap.add_argument("--device", default="cpu",
                     help="MlpPolicy 用 cpu 反而更快，默认 cpu")
     ap.add_argument("--tb", default=None, help="tensorboard 日志目录（需要装 tensorboard）")
@@ -226,7 +232,8 @@ def main():
 
     envs = build_envs(mgr, combat=args.combat, catalog=args.catalog,
                       min_enemies=args.min_enemies,
-                      max_enemies=args.max_enemies)
+                      max_enemies=args.max_enemies,
+                      chunk=args.chunk)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
 
@@ -242,7 +249,7 @@ def main():
     else:
         model = PPO(
             "MlpPolicy", venv,
-            n_steps=256, batch_size=64, n_epochs=10,
+            n_steps=args.n_steps, batch_size=args.batch, n_epochs=10,
             gamma=0.99, gae_lambda=0.95, clip_range=0.2,
             ent_coef=args.ent_coef, learning_rate=args.lr,
             policy_kwargs=dict(net_arch=dict(pi=[128, 128], vf=[128, 128])),

@@ -33,9 +33,23 @@ from isaac_bridge import (IsaacBridge, get_enemies, get_enemy_projectiles, get_p
 MAX_ENEMIES = 16
 MAX_TEARS = 48
 GRID_WIN = 7  # 7x7 局部网格
-# 观测维度（借鉴 AIsaac：实体带碰撞体积/类别，子弹带高度）
-#   玩家6 + 敌人16*8 + 子弹48*5 + 网格49 + 房间2 + 门12
-OBS_DIM = 6 + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN + 2 + 4 * 3  # 437
+# 玩家特征：x,y,vx,vy,hp,alive + fire_dir(x,y) + head_dir(x,y) + iframes + damage
+#           + shot_speed + move_speed = 14
+PLAYER_DIM = 14
+# 观测维度：
+#   玩家14 + 敌人16*8 + 子弹48*5 + 网格49 + 房间2 + 门12
+OBS_DIM = PLAYER_DIM + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN + 2 + 4 * 3  # 445
+
+# Direction 枚举: 0=左 1=上 2=右 3=下
+_DIR_XY = {0: (-1.0, 0.0), 1: (0.0, -1.0), 2: (1.0, 0.0), 3: (0.0, 1.0)}
+
+
+def _dir_xy(d):
+    """Direction -> 单位向量；无朝向返回 (0,0)。"""
+    try:
+        return _DIR_XY.get(int(d), (0.0, 0.0))
+    except (TypeError, ValueError):
+        return (0.0, 0.0)
 
 # 8 方向：0=右 1=右下 2=下 3=左下 4=左 5=左上 6=上 7=右上
 DIRS8 = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
@@ -201,6 +215,18 @@ def build_obs(state, grid):
     obs.append(_clip(p["vy"] / VEL_SCALE))
     obs.append(_clip((p["hp"] + p["soul_hp"]) / HP_SCALE))
     obs.append(1.0 if p["hp"] > 0 else 0.0)
+
+    # 朝向：没有这个 AI 不知道自己正朝哪射（泪弹方向 = 射击键 + 玩家速度），"瞄不准"的直接原因
+    fx, fy = _dir_xy(p.get("fire_dir"))
+    obs.append(fx)
+    obs.append(fy)
+    hx, hy = _dir_xy(p.get("head_dir"))
+    obs.append(hx)
+    obs.append(hy)
+    obs.append(_clip(float(p.get("iframes", 0) or 0) / 60.0))          # 无敌帧
+    obs.append(_clip(float(p.get("damage", 3.5) or 3.5) / 10.0))        # 单发伤害
+    obs.append(_clip(float(p.get("shot_speed", 10.0) or 10.0) / 10.0))  # 泪速（算提前量）
+    obs.append(_clip(float(p.get("move_speed", 1.0) or 1.0) / 2.0))     # 移速（甩枪幅度）
 
     # 敌人（按距离排序，取最近的 MAX_ENEMIES 个；每个 8 维）
     enemies = get_enemies(state)

@@ -270,6 +270,15 @@ local function build_state()
         entities = build_entities(room),
     }
 
+    -- 朝向 / 无敌帧：没有这些 AI 不知道自己正朝哪射（泪弹方向 = 射击键方向 + 玩家速度），
+    -- 所以要靠速度反推，很难瞄得准。AIsaac 的玩家观测也带 head_dir/fire_dir。
+    pcall(function()
+        local pl = Isaac.GetPlayer(0)
+        state.player.fire_dir = pl:GetFireDirection()   -- 0=左 1=上 2=右 3=下 -1=无
+        state.player.head_dir = pl:GetHeadDirection()
+        state.player.iframes = pl:GetDamageCooldown()   -- 剩余无敌帧
+    end)
+
     -- 门（每帧都发，门开/关会变）
     local okd, doors = pcall(build_doors, room)
     if okd then
