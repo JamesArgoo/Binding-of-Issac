@@ -208,15 +208,22 @@ def build_obs(state, grid):
 class IsaacEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, frame_skip=2):
+    def __init__(self, frame_skip=2, port=None, controller=None, bridge=None):
         super().__init__()
         self.frame_skip = frame_skip
         self.action_space = spaces.MultiDiscrete([9, 9])
         self.observation_space = spaces.Box(-10.0, 10.0, shape=(OBS_DIM,), dtype=np.float32)
 
-        self.bridge = IsaacBridge()
-        self.bridge.start()
-        self.kc = KeyController()
+        # 多开时由 InstanceManager 注入 bridge + controller（各实例端口/窗口都不同）；
+        # 单开时自己起桥接、用 pyautogui 打当前焦点窗口。
+        if bridge is not None:
+            self.bridge = bridge
+            self._owns_bridge = False
+        else:
+            self.bridge = IsaacBridge(port=port) if port is not None else IsaacBridge()
+            self.bridge.start()
+            self._owns_bridge = True
+        self.kc = controller if controller is not None else KeyController()
         self.grid = None
 
         self.prev_hp = 0.0
@@ -352,4 +359,5 @@ class IsaacEnv(gym.Env):
 
     def close(self):
         self.kc.release_all()
-        self.bridge.stop()
+        if self._owns_bridge:
+            self.bridge.stop()
