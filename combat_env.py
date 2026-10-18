@@ -29,7 +29,7 @@ import numpy as np
 from gymnasium import spaces
 
 from isaac_bridge import get_enemies, get_player
-from isaac_env import OBS_DIM, build_obs, normalize_grid
+from isaac_env import OBS_DIM, build_obs, cell_walkable, normalize_grid
 
 # ---- 动作：移动 0-7 = DIRS8 八方向，8 = 停；射击 0 = 不射，1=上 2=右 3=下 4=左 ----
 DIRS8 = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
@@ -47,6 +47,7 @@ ALIGN = 0.2             # 对齐势权重（AIsaac HRW align=0.2）
 GAMMA = 0.99            # 势函数折扣，必须和 PPO 的 gamma 一致
 D_OPT = 150.0           # 理想射击距离（像素）：太近会被撞，太远打不着
 CELL = 40.0             # 一格 40 世界单位（AIsaac 的 CELL）
+WALL_PUSH = 0.6         # 顶着墙/障碍物推的每秒惩罚（治"怼着石头走"）
 SCALE = 0.1             # 整体缩放
 FPS = 30.0              # 决策频率（frame_skip=2 对应 30Hz）
 RATE_WINDOW = 45        # 命中率统计窗口（步）
@@ -121,6 +122,7 @@ class CombatEnv(gym.Env):
         self._ep_fired = 0.0
         self._ep_clear = 0
         self._ep_hurt = 0.0
+        self._ep_wall = 0
 
     # ---------------- 工具 ----------------
     def _state(self):
@@ -234,6 +236,7 @@ class CombatEnv(gym.Env):
         self._ep_fired = 0.0
         self._ep_clear = 0
         self._ep_hurt = 0.0
+        self._ep_wall = 0
 
         # 血量与对齐势的初值（势函数必须从当前状态起算，否则第一步会凭空多出一笔奖励）
         pp = s.get("player", {}) if s else {}
@@ -274,7 +277,7 @@ class CombatEnv(gym.Env):
             if not s or "player" not in s:
                 break
 
-            r, term, info = self._reward(s)
+            r, term, info = self._reward(s, mx, my)
             total_r += r
             if term:
                 terminated = True
@@ -289,7 +292,7 @@ class CombatEnv(gym.Env):
             self.kc.release_all()
         return obs, float(total_r), bool(terminated), bool(truncated), info
 
-    def _reward(self, s):
+    def _reward(self, s, mx=0, my=0):
         p = s["player"]
         cur_hp, cur_alive = self._scan_enemies(s)
         hp_now = float(p["hp"]) + float(p["soul_hp"])
@@ -315,6 +318,16 @@ class CombatEnv(gym.Env):
         r += max(0.0, dealt) / HIT_HP
         r += kills * KILL
         r -= time_price(rate) * (self.frame_skip / 60.0)
+
+        # ---- 顶墙/顶障碍物惩罚 ----
+        #     想走的方向是墙、石头、便便就直接扣分：逼 AI 别对着障碍物干瞪眼。
+        #     只看网格碰撞，不依赖物理位移，所以没有延迟。
+        if (mx or my) and self.grid is not None and p.get("grid_idx") is not None:
+            w = self.grid["w"]
+            gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
+            if not cell_walkable(gx + mx, gy + my, self.grid):
+                r -= WALL_PUSH * (self.frame_skip / 60.0)
+                self._ep_wall += 1
 
         # ---- 受伤：凹形血量曲线，越接近死亡掉血越贵 ----
         #     之前照抄的 hit-rate 配置里压根没有这一项（那是"玩家无敌"的实验配置），
@@ -355,8 +368,8 @@ class CombatEnv(gym.Env):
         info = {
             "dealt": dealt, "kills": kills, "fired": fired,
             "hit_rate": rate, "clear": cleared, "dead": dead,
-            "hurt": self._ep_hurt, "ep_dealt": self._ep_dealt,
-            "ep_fired": self._ep_fired,
+            "hurt": self._ep_hurt, "wall": self._ep_wall,
+            "ep_dealt": self._ep_dealt, "ep_fired": self._ep_fired,
         }
 
         self._prev_enemy_hp, self._prev_alive = cur_hp, cur_alive
