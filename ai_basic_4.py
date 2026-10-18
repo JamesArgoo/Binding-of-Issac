@@ -308,15 +308,44 @@ def plan_move(state, grid, p, target, enemies, projectiles, debug=None):
             ex_y = p["y"] + d[1] * move_speed * K
             dt = math.hypot(target["x"] - ex_x, target["y"] - ex_y)
             score += 2.0 * max(0.0, 1.0 - dt / max(dist_now, 1.0))
-        # 无威胁时轻微偏好原地，避免无意义漂移
+        # 永不停在原地：原来这里给 (0,0) 加 0.05 分，导致没威胁时它站着不动。
+        # 改成轻微惩罚，让任何安全方向都优先于静止。
         if d == (0, 0):
-            score += 0.05
+            score -= 0.30
         results.append((d, score))
         if score > best_score:
             best_dir, best_score = d, score
     if debug is not None:
         debug["candidates"] = results
     return best_dir
+
+
+def _fallback_move(state, grid, p):
+    """兜底方向：绝不返回 (0,0)。
+
+    原来 _go_to_door 在"房间没清空 / 门没开 / 已站在门上"时会返回 (0,0)，
+    表现就是站在门边发呆。这里改成朝房间中心走（中心通常最开阔），
+    走不了就挑任意可走方向。
+    """
+    if grid is None or p.get("grid_idx") is None:
+        return (0, 0)
+    w, h = grid["w"], grid["h"]
+    gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
+    cx, cy = w // 2, h // 2
+    best, best_d = (0, 0), 1e18
+    for d in DIRS8:
+        if not cell_walkable(gx + d[0], gy + d[1], grid):
+            continue
+        dd = abs(gx + d[0] - cx) + abs(gy + d[1] - cy)
+        if dd < best_d:
+            best, best_d = d, dd
+    if best != (0, 0):
+        return best
+    # 连中心方向都不可走：沿任意可走方向挪（含斜向）
+    for d in DIRS8:
+        if cell_walkable(gx + d[0], gy + d[1], grid):
+            return d
+    return (0, 0)
 
 
 def decide(state, grid, last_door=None, debug=None):
@@ -328,6 +357,9 @@ def decide(state, grid, last_door=None, debug=None):
     # --- 房间清空 / 无敌人：去最近的开门 ---
     if room_clear or target is None:
         move = _go_to_door(state, grid, last_door)
+        if move == (0, 0):
+            # 门还没开 / 已经站在门上 —— 不允许原地发呆，朝房间中心走
+            move = _fallback_move(state, grid, p)
         if debug is not None:
             debug["target"] = None
             debug["candidates"] = []
@@ -339,6 +371,8 @@ def decide(state, grid, last_door=None, debug=None):
     # 1) 移动：8 方向候选采样 + 前瞻模拟（综合所有子弹/敌人/墙，避免局部最优）
     projectiles = get_enemy_projectiles(state)
     move = plan_move(state, grid, p, target, enemies, projectiles, debug=debug)
+    if move == (0, 0):
+        move = _fallback_move(state, grid, p)
     if grid is not None and p.get("grid_idx") is not None and move != (0, 0):
         move = wall_steer(move[0], move[1], p["grid_idx"], grid)
 
