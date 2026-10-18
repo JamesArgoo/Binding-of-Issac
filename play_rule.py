@@ -48,6 +48,7 @@ def main():
     print("按 Ctrl+C 停止\n")
 
     grid = None
+    map_cache = None   # 模组每 30 帧才发一次 map，必须自己缓存住
     last_door = None
     prev_room = None
     prev_door = None
@@ -64,6 +65,12 @@ def main():
                 continue
             if "grid" in s:
                 grid = normalize_grid(s["grid"])
+            # 地图（房间 visited 计数）每 30 帧才来一次；不缓存的话
+            # _go_to_door 里"优先去未探索房间"永远拿不到数据 -> 两个房间无限横跳
+            if "map" in s:
+                map_cache = s["map"]
+            elif map_cache is not None:
+                s["map"] = map_cache
 
             room_idx = s["room"]["index"]
             if prev_room is not None and room_idx != prev_room:
