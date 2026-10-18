@@ -27,3 +27,9 @@ Thumbs.db
 *.png
 savedatapath.txt
 models/smoke_*
+
+# ===== 训练产物（体积大，可重训）=====
+models/combat_*.zip
+models/multi_*.zip
+models/*_smoke*.zip
+room_catalog_test.json

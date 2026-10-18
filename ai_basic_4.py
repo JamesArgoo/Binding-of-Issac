@@ -174,6 +174,11 @@ def nearest_open_door_grid(state, grid):
     return min(open_doors, key=gdist)["grid"]
 
 
+def _neighbor_room_grid(room_grid, slot):
+    """门 slot: 0=上 1=右 2=下 3=左；楼层房间地图是 13x13。"""
+    return room_grid + {0: -13, 1: 1, 2: 13, 3: -1}.get(slot, 0)
+
+
 def _go_to_door(state, grid, last_door=None):
     """房间清空时，走到最近的开门。返回 8 方向 (mx, my)。"""
     p = get_player(state)
@@ -187,8 +192,16 @@ def _go_to_door(state, grid, last_door=None):
     def gdist(d):
         return abs(d["grid"] % w - p["grid_idx"] % w) + abs(d["grid"] // w - p["grid_idx"] // w)
 
-    # 优先不走上一次走过的门（减少来回横跳）
-    candidates = [d for d in open_doors if d["grid"] != last_door] or open_doors
+    # 第一优先：通往没探过的房间的门。
+    # 只靠"避开刚来的那扇门"是不够的 —— 实测会在两个已清空房间之间无限来回弹，
+    # 永远遇不到敌人（录了4分钟只走了2个房间）。
+    room_grid = state["room"]["index"]
+    visited = {r["grid"]: r["visited"] for r in state.get("map", [])}
+    fresh = [d for d in open_doors
+             if visited.get(_neighbor_room_grid(room_grid, d.get("slot", -1)), 1) == 0]
+
+    # 其次：避开上一次走过的门，减少原地横跳
+    candidates = fresh or ([d for d in open_doors if d["grid"] != last_door] or open_doors)
     best = min(candidates, key=gdist)
     path = astar(grid, p["grid_idx"], best["grid"])
     if path and len(path) >= 2:

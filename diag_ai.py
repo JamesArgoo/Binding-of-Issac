@@ -72,19 +72,25 @@ def sample_with_grid(mgr, index, timeout=6.0):
     with_grid = 0
     last_with_grid = None
     last = None
+    last_map = None
     while time.time() - t0 < timeout:
         s = mgr.state(index)
         if s and "player" in s:
             seen += 1
+            if "map" in s:
+                last_map = s["map"]
             if "grid" in s:
                 with_grid += 1
                 normalize_grid(s["grid"])   # 按玩家口径重算可走性（门是 coll=5）
                 last_with_grid = s
             last = s
-        if with_grid >= 2:
+        if with_grid >= 2 and last_map is not None:
             break
         time.sleep(0.05)
-    return (last_with_grid or last), seen, with_grid
+    out = last_with_grid or last
+    if out is not None and last_map is not None and "map" not in out:
+        out["map"] = last_map
+    return out, seen, with_grid
 
 
 def main():
@@ -167,6 +173,25 @@ def main():
             print(f"  房间碰撞类别分布: {dict(Counter(coll))}")
         else:
             print("房间没有开着的门 → 老师会原地不动")
+
+        # ---- 地图 / 未探索邻居：判断"优先去新房间"到底有没有生效 ----
+        mp = s.get("map")
+        print(f"地图数据: {'没有!' if not mp else str(len(mp)) + ' 个房间'}")
+        if mp:
+            visited = {r["grid"]: r["visited"] for r in mp}
+            rg = s["room"]["index"]
+            names = {0: "上", 1: "右", 2: "下", 3: "左"}
+            for slot, delta in ((0, -13), (1, 1), (2, 13), (3, -1)):
+                ng = rg + delta
+                in_map = ng in visited
+                print(f"  {names[slot]}邻居 room={ng}: "
+                      f"{'visited=' + str(visited[ng]) if in_map else '不在图上'}")
+            print(f"  当前房间 room={rg}")
+            open_slots = [(d.get("slot"), d.get("grid")) for d in doors if d.get("open")]
+            print(f"  开着的门 (slot,grid): {open_slots}")
+            fresh = [d for d in doors if d.get("open")
+                     and visited.get(rg + {0: -13, 1: 1, 2: 13, 3: -1}.get(d.get("slot", -1), 0), 1) == 0]
+            print(f"  通往未探索房间的门: {[(d.get('slot'), d.get('grid')) for d in fresh]}")
 
     mgr.stop_all()
     return 0

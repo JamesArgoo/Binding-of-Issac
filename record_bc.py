@@ -28,6 +28,7 @@ except Exception:
 
 import ai_basic_4 as teacher
 import multi_instance as mi
+from isaac_bridge import get_enemies
 from isaac_env import DIRS8, build_obs, normalize_grid
 
 
@@ -53,10 +54,14 @@ class Recorder(threading.Thread):
         self.obs = []
         self.acts = []
         self.grid = None
+        self.map_data = None    # 地图只在每 30 帧发一次，必须自己缓存住
         self.last_door = None
         self.prev_room = None
         self.prev_door = None
         self.errors = 0
+        self.rooms = set()      # 访问过的房间，用来判断老师有没有真的在推进
+        self.combat = 0         # 有敌人的帧数（战斗样本比例）
+        self.no_move = 0        # 原地不动的帧数
 
     def run(self):
         while not self.stop_flag.is_set():
@@ -67,11 +72,20 @@ class Recorder(threading.Thread):
             try:
                 if "grid" in s:
                     self.grid = normalize_grid(s["grid"])
+                # 地图每 30 帧才发一次；缓存住并回填，否则"优先去未探索房间"永远失效
+                if "map" in s:
+                    self.map_data = s["map"]
+                elif self.map_data is not None:
+                    s["map"] = self.map_data
 
                 # 换房间时告诉老师"我是从哪扇门过来的"，避免原地打转
                 room_idx = s["room"]["index"]
                 if self.prev_room is not None and room_idx != self.prev_room:
                     self.last_door = self.prev_door
+                    if self.verbose:
+                        print(f"[实例{self.inst.index}] 换房间 "
+                              f"{self.prev_room} → {room_idx}  "
+                              f"last_door={self.last_door}", flush=True)
                 self.prev_room = room_idx
                 self.prev_door = teacher.nearest_open_door_grid(s, self.grid)
 
@@ -81,6 +95,12 @@ class Recorder(threading.Thread):
 
                 self.kc.set_move(mx, my)
                 self.kc.set_shoot(ax, ay)
+
+                self.rooms.add(room_idx)
+                if get_enemies(s):
+                    self.combat += 1
+                if (mx, my) == (0, 0):
+                    self.no_move += 1
 
                 self.obs.append(obs)
                 self.acts.append((action_index(mx, my), action_index(ax, ay)))
@@ -163,6 +183,14 @@ def main():
     s_d = np.bincount(act[:, 1], minlength=9) / len(act)
     print("移动动作分布(0-7=八方向, 8=不动):", np.round(m_d, 3))
     print("射击动作分布(0-7=八方向, 8=不射):", np.round(s_d, 3))
+
+    print("\n各实例情况（判断老师有没有真的在推进）：")
+    for r in recs:
+        n = len(r.acts)
+        if not n:
+            continue
+        print(f"  实例{r.inst.index}: {n} 条, 访问 {len(r.rooms)} 个房间, "
+              f"战斗帧 {r.combat / n:.0%}, 原地不动 {r.no_move / n:.0%}, 异常 {r.errors}")
 
     np.savez_compressed(args.out, obs=obs, act=act)
     print(f"已保存 {args.out}")
