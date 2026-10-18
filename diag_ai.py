@@ -3,6 +3,7 @@
 
 用法：python diag_ai.py
 """
+import argparse
 import sys
 
 try:
@@ -12,7 +13,52 @@ except Exception:
 
 import ai_basic_4 as teacher
 import multi_instance as mi
+from isaac_bridge import get_enemies
 from isaac_env import normalize_grid
+
+
+def watch(mgr, seconds=20.0, every=0.03):
+    """高速采样，只在状态/决策变化时打印 —— 看老师到底在干什么。
+
+    注意采样必须比 grid 发送频率(约0.5s一次)快很多，否则会混叠，
+    导致某个实例一直错过 grid、误报 (0,0)。
+    """
+    import time
+    t0 = time.time()
+    grids = {}
+    last_sig = {}
+    while time.time() - t0 < seconds:
+        for inst in mgr.instances:
+            s = mgr.state(inst.index)
+            if not s or "player" not in s:
+                continue
+            if "grid" in s:
+                grids[inst.index] = normalize_grid(s["grid"])
+            g = grids.get(inst.index)
+            p = s["player"]
+            enemies = get_enemies(s)
+            d = teacher.decide(s, g, None)
+            sig = (s["room"]["index"], s["room"]["clear"], len(enemies),
+                   p["grid_idx"], d)
+            if last_sig.get(inst.index) == sig:
+                continue
+            last_sig[inst.index] = sig
+            od = [x for x in s.get("doors", []) if x.get("open")]
+            extra = f" 开门={len(od)}"
+            if g and od and p.get("grid_idx") is not None:
+                w = g["w"]
+                best = min(od, key=lambda x: abs(x["grid"] % w - p["grid_idx"] % w)
+                           + abs(x["grid"] // w - p["grid_idx"] // w))
+                path = teacher.astar(g, p["grid_idx"], best["grid"])
+                extra += f" 门={best['grid']} 路={'无' if not path else len(path)}"
+            elif not g:
+                extra += " grid=None"
+            print(f"[{time.time() - t0:5.1f}s] 实例{inst.index} "
+                  f"room={s['room']['index']} clear={s['room']['clear']} "
+                  f"敌={len(enemies)} 格={p['grid_idx']} HP={p['hp']} "
+                  f"→ move=({d[0]},{d[1]}) aim=({d[2]},{d[3]}){extra}")
+        time.sleep(every)
+        time.sleep(every)
 
 
 def sample_with_grid(mgr, index, timeout=6.0):
@@ -42,11 +88,21 @@ def sample_with_grid(mgr, index, timeout=6.0):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--watch", type=float, default=0.0,
+                    help="连续观测 N 秒，打印每个实例的状态和决策")
+    args = ap.parse_args()
+
     mgr = mi.InstanceManager(n=1)
     mgr.attach(verbose=False)
     if not mgr.wait_connections(90, verbose=False):
         print("没有实例在对局里")
         return 1
+
+    if args.watch > 0:
+        watch(mgr, args.watch)
+        mgr.stop_all()
+        return 0
 
     for inst in mgr.instances:
         s, seen, with_grid = sample_with_grid(mgr, inst.index)
