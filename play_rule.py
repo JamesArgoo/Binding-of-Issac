@@ -50,7 +50,7 @@ def main():
 
     grid = None
     map_cache = None   # 模组每 30 帧才发一次 map，必须自己缓存住
-    recent_rooms = deque(maxlen=5)   # 最近去过的房间（防 A-B-A-B 打转）
+    recent_rooms = deque(maxlen=3)   # 记录**来源房间**（防 A-B-A-B 打转）
     last_door = None
     prev_room = None
     prev_door = None
@@ -89,10 +89,19 @@ def main():
             #         recent_rooms 恒为空，所有门选择逻辑全是死代码。
             if prev_room is not None and room_idx != prev_room:
                 # 刚跨门那一帧人紧贴入口门，cur_door 就是入口门 ✅
-                # （原来 last_door = prev_door 拿的是旧房间坐标，换房间后无意义，
-                #   所以"别从入口门回去"永远匹配不到 → 每帧选最近的门 → A<->B 横跳）
                 last_door = cur_door
-                recent_rooms.append(room_idx)
+                # 【关键】append 的是**来源房间**，不是刚进入的房间。
+                # decide 里 recent 的语义是"要避开的房间"（通往它们的门 +100 分惩罚）。
+                # 原来 append(room_idx) 放的是"我现在所在的房间"，没有任何门通向它，
+                # 这条逻辑等于空转。
+                recent_rooms.append(prev_room)
+                # 换房后地图缓存必然陈旧（map 每 30 帧才发一次），先清掉，
+                # 靠 last_door + recent 的惩罚顶过这段空窗期
+                map_cache = None
+                p0 = s["player"]
+                print(f"[换房] {prev_room} -> {room_idx}  "
+                      f"player=({p0['x']:.0f},{p0['y']:.0f})  cur_door={cur_door}  "
+                      f"来源队列={list(recent_rooms)}")
             prev_room = room_idx
             prev_door = cur_door
 
