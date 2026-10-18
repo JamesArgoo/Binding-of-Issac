@@ -22,9 +22,13 @@ local cur_port = nil    -- 当前连接的端口，发给 Python 便于对账
 local bound_port = nil  -- 已绑定的端口：掉线后优先回到它，防止被别的实例的空闲端口抢走
 local connected_at = 0  -- 连上时的帧号：用来区分"刚连上就被踢"和"真的掉线"
 
-local AUTO_RESTART = false  -- 死亡后自动重开。单房间战斗训练由 Python 下发 restart/goto，
-                            -- 这里关掉避免和环境的 reset 打架。
+local AUTO_RESTART = true   -- 死亡后自动重开。必须在"刚死"的瞬间重开：
+                            -- 等进了死亡结算画面，Isaac.ExecuteCommand("restart") 就无效了，
+                            -- 玩家会永远卡在 game over 里（实测踩过）。
+                            -- 单房间战斗训练也靠它续命，所以这里保持开启。
+local AUTO_START_EVERY = 60 -- 死着就每秒重试一次重开
 local was_dead = false
+local last_restart_frame = -999
 
 -- 无人值守：新开的实例停在主菜单时，自己尝试把对局开起来
 local AUTO_START = true
@@ -296,14 +300,18 @@ function mod:onUpdate()
     -- 先处理 Python 下发的命令（每帧都收，保证 reset 够快）
     poll_commands()
 
-    -- 死亡自动重开（开关见 AUTO_RESTART；改由 Python 控制 reset 时可关掉）
+    -- 死亡自动重开：死了就反复重试（一进结算画面 restart 就失效，所以要抢在刚死时）
     if AUTO_RESTART then
         local pl = Isaac.GetPlayer(0)
-        local dead = (pl ~= nil and pl:IsDead())
-        if dead and not was_dead then
-            Isaac.ExecuteCommand("restart")
+        if pl ~= nil and pl:IsDead() then
+            if frame - last_restart_frame > AUTO_START_EVERY then
+                last_restart_frame = frame
+                pcall(function() Isaac.ExecuteCommand("restart") end)
+            end
+            was_dead = true
+        else
+            was_dead = false
         end
-        was_dead = dead
     end
 
     if frame % SEND_EVERY ~= 0 then

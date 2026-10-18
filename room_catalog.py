@@ -24,12 +24,36 @@ except Exception:
 import multi_instance as mi
 
 
-def probe_one(ch, variant, settle=0.35):
-    """goto 一个 variant，返回房间信息；goto 没生效(房间号没变)就返回 None。"""
-    before = ch.state()
-    prev_room = None
-    if before and "room" in before:
-        prev_room = before["room"]["index"]
+def alive(s):
+    return bool(s and "player" in s
+                and (s["player"]["hp"] + s["player"]["soul_hp"]) > 0)
+
+
+def ensure_alive(ch, timeout=20.0):
+    """探测时玩家是不动的，会被敌人打死。死了就 restart 再来。
+
+    注意：死亡结算画面要几秒才结束，restart 短时间内不生效，所以超时给得比较长。
+    """
+    if alive(ch.state()):
+        return True
+    for _ in range(2):
+        ch.send("restart")
+        t0 = time.time()
+        while time.time() - t0 < timeout / 2:
+            if alive(ch.state()):
+                return True
+            time.sleep(0.05)
+    return False
+
+
+def probe_one(ch, variant, settle=0.5):
+    """goto 一个 variant，返回房间信息。
+
+    注意：goto 造出来的房间 `room.index` 恒为 -3（不在楼层地图上），
+    所以不能用"房间号变没变"判断成功与否 —— 只能看这次 settle 后的敌人组成。
+    """
+    if not ensure_alive(ch):
+        return None
 
     if not ch.send(f"goto d.{variant}"):
         return None
@@ -38,8 +62,8 @@ def probe_one(ch, variant, settle=0.35):
     s = ch.state()
     if not s or "player" not in s or "room" not in s:
         return None
-    if prev_room is not None and s["room"]["index"] == prev_room:
-        return None                              # goto 没生效（这个 variant 不存在）
+    if not alive(s):
+        return None
 
     enemies = [e for e in s.get("entities", []) if e.get("enemy") or e.get("boss")]
     return dict(

@@ -150,35 +150,32 @@ class CombatEnv(gym.Env):
         super().reset(seed=seed)
         self.kc.release_all()
 
-        # 1) 重开一局（楼层重置）
+        # 1) 重开一局：每回合都重开，保证满血、楼层一致
+        #    注意死亡结算画面要好几秒才结束，restart 在期间不生效，所以超时给长一点
+        if not self._alive(self._state()):
+            for _ in range(2):
+                self._cmd("restart")
+                if self._wait(lambda st: self._alive(st), timeout=12.0):
+                    break
         self._cmd("restart")
-        s = self._wait(lambda st: self._alive(st), timeout=20.0)
+        self._wait(lambda st: self._alive(st), timeout=15.0)
+
+        # 2) 传送进一个有敌人的房间
+        #    goto 造出来的房间 room.index 恒为 -3（不在楼层地图上），
+        #    所以不能拿"房间号变了"当成功标志，改成固定 settle + 等 grid 到位。
+        variant = int(self.rng.choice(self.variants))
+        self._cmd(f"goto d.{variant}")
+        time.sleep(0.6)
+        s = self._wait(lambda st: self._alive(st) and "grid" in st, timeout=8.0)
         if s is None:
             s = self._state()
 
-        # 2) 传送进一个有敌人的房间
-        prev_room = None
-        s = self._state()
-        if s and "room" in s:
-            prev_room = s["room"]["index"]
-        variant = int(self.rng.choice(self.variants))
-        self._cmd(f"goto d.{variant}")
-        s2 = self._wait(
-            lambda st: (st and "player" in st and "room" in st
-                        and st["room"]["index"] != prev_room
-                        and self._alive(st)),
-            timeout=10.0)
-        if s2 is None:
-            s2 = self._state()
-
-        # 3) 等房间稳定（拿到 grid）
-        s3 = self._wait(lambda st: st and "grid" in st, timeout=6.0)
-        s = s3 or s2 or self._state() or {"player": {"x": 0, "y": 0, "vx": 0, "vy": 0,
-                                                     "hp": 0, "soul_hp": 0, "grid_idx": 0,
-                                                     "damage": 3.5},
-                                           "room": {"index": -1, "clear": False,
-                                                    "enemies_alive": 0},
-                                           "entities": []}
+        # 3) 兜底
+        if s is None:
+            s = {"player": {"x": 0, "y": 0, "vx": 0, "vy": 0, "hp": 0, "soul_hp": 0,
+                            "grid_idx": 0, "damage": 3.5},
+                 "room": {"index": -1, "clear": False, "enemies_alive": 0},
+                 "entities": []}
 
         # 4) 初始化统计
         self.last_state = s
