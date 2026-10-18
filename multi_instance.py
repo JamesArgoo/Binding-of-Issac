@@ -386,6 +386,27 @@ class InstanceManager:
             self.resolve_mapping(verbose=verbose)
         return self.instances
 
+    # ---------- 接管已在运行的游戏 ----------
+    def attach(self, verbose=True):
+        """不启动新游戏，直接接管当前所有开着的 Isaac 窗口。"""
+        wins = isaac_windows()
+        if not wins:
+            raise RuntimeError("没有找到 Isaac 窗口")
+        wins = wins[:self.bridge.max_instances]
+        for k, (hwnd, pid, _cls, _title) in enumerate(wins):
+            self.bridge.open_port(self.bridge.base_port + k)
+            inst = Instance(k, self.bridge.base_port + k, None)
+            inst.hwnd, inst.pid = hwnd, pid
+            inst.controller = Win32KeyController(hwnd)
+            self.instances.append(inst)
+        self.n = len(self.instances)
+        self._started = True
+        if verbose:
+            print(f"接管了 {self.n} 个实例：")
+            for inst in self.instances:
+                print(f"  {inst}")
+        return self.instances
+
     # ---------- 等对局 ----------
     def wait_connections(self, timeout=900.0, verbose=True):
         """等所有端口都连上（等价于每个窗口都进了对局）。"""

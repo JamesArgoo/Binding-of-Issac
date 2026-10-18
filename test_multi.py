@@ -115,15 +115,19 @@ def main():
         for inst in mgr.instances:
             print(f"  {inst!r}")
     elif args.attach:
-        wins = mi.isaac_windows()
-        if not wins:
-            print("没找到 Isaac 窗口。")
+        mgr = mi.InstanceManager(n=1)
+        try:
+            mgr.attach()
+        except Exception as e:
+            print(f"接管失败: {e}")
             return 1
-        print("==== 已开着的 Isaac 窗口 ====")
-        for hwnd, pid, cls, title in wins:
-            print(f"  hwnd={hwnd} pid={pid} class={cls!r} title={title!r}")
-        print("\n(--attach 只能验输入注入，端口映射需要 --launch)")
-        return 0
+        print("\n等各实例的模组连上来（确认每个窗口都在对局里）...")
+        if not mgr.wait_connections(args.run_timeout):
+            print("超时：有窗口没进对局")
+            mgr.stop_all()
+            return 2
+        print("\n==== 端口 ↔ 窗口 对号 ====")
+        mgr.resolve_mapping()
     else:
         print("需要 --launch N 或 --attach")
         return 1
