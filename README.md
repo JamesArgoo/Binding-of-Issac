@@ -82,10 +82,20 @@ isaac_bridge.py  diag.py仅用于测试，测试是否能够获取数据。
 | 文件 | 作用 |
 |---|---|
 | `multi_instance.py` | 多开核心：PostMessage 控制器 + 多端口桥接 + 实例管理器 + 端口对号 |
-| `test_multi.py` | 多开验证脚本（启动 N 实例 → 等对局 → 对号 → 注入测试） |
+| `train_multi.py` | **多开并行训练**：N 个实例同时采样，PPO 一起学 |
+| `test_multi.py` | 多开验证脚本（启动/接管 N 实例 → 等对局 → 对号 → 注入测试） |
 | `test_inject.py` | 对已开着的游戏单独测 PostMessage 注入（焦点内 / 失焦） |
 | `probe.py` | 探针：只听某个端口，确认模组 socket 通路是否正常 |
 | `isaac_ai_bridge/main.lua` | 桥接模组，支持端口段 + 掉线守住原端口 + 死亡自动重开 |
+
+## 吞吐实测
+
+| 配置 | 步/秒 |
+|---|---|
+| 单实例 | ~25-30 |
+| **2 实例并行** | **49.2** |
+
+**线性加速确认。** 24 核机器上 8~12 实例是现实上限（受 CPU/GPU/内存限制）。
 
 ## 用法
 
@@ -96,11 +106,29 @@ python test_inject.py          # 再测焦点内 / 失焦注入
 
 # 2) 多开验证（会自己启动 N 个游戏，需要你在每个窗口里手动开一局）
 python test_multi.py --launch 2 --keep --run-timeout 600
+
+# 3) 多开训练（接管已经在跑的游戏）
+python train_multi.py --attach --steps 20000
+
+# 4) 多开训练（自己启动 3 个实例，从 BC 模型热启动）
+python train_multi.py --launch 3 --load models/isaac_ppo_bc --steps 200000
 ```
+
+> 注意：`--device cpu` 是默认值。MlpPolicy 在 GPU 上反而更慢（SB3 官方建议）。
+
+## 重要教训（血的代价）
+
+- **绝对不要 `Stop-Process -Force` 杀掉正在写存档的游戏**，也不要让多个实例同时跑在对局里再强杀。
+  实测这样做会让 `rep_persistentgamedata1.dat` 被重置成 3956 字节的空档。
+  正常关窗（游戏自己保存）没问题。
+- 万一存档没了：同目录下 `YYYYMMDD.rep_persistentgamedataN.dat` 是历史备份，
+  头部都是 `ISAACNGSAVE09R`，可以直接改回正式文件名恢复。
 
 ## 待办
 
-- [ ] 把多开接进训练脚本：N 个 `IsaacEnv` 并行采样
-- [ ] 存档串写风险的处置（备份 / 统一用某个备用存档槽）
-- [ ] 评估精简 mods 目录能提速多少
-- [ ] 重新实现 `record_bc.py`，用规则AI当老师录 BC 数据
+- [x] 把多开接进训练脚本：N 个 `IsaacEnv` 并行采样（`train_multi.py`，2 实例 49 步/秒）
+- [x] 存档串写风险：确认可按弃用处理，训练用全新存档（用户确认）
+- [ ] 重新实现 `record_bc.py`，用规则AI当老师录 BC 数据 → BC 热启动 → RL 微调
+- [ ] 评估精简 mods 目录能提速多少（mods 路径相对 cwd）
+- [ ] 试 `VSync=0` 看单实例能否跑超 60fps
+- [ ] 多开规模上限实测（4/6/8 实例的步/秒曲线）
