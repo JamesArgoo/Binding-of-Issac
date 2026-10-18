@@ -182,6 +182,9 @@ class CombatEnv(gym.Env):
         self.steps = 0
         self._prev_enemy_hp, self._prev_alive = self._scan_enemies(s)
         self._prev_clear = bool(s.get("room", {}).get("clear"))
+        # 如果 goto 落到了一个本来就已清空的房间，不能立刻判 terminated，
+        # 否则会陷入 reset→立即结束→reset 的死循环
+        self._started_clear = self._prev_clear
         self._prev_room = s.get("room", {}).get("index")
         self._seen_tears = set()
         self._rate_window.clear()
@@ -246,7 +249,7 @@ class CombatEnv(gym.Env):
         # ---- 清房 ----
         room = s.get("room", {})
         cleared = bool(room.get("clear"))
-        if cleared and not self._prev_clear:
+        if cleared and not self._prev_clear and not self._started_clear:
             r += CLEAR
             self._ep_clear += 1
 
@@ -255,7 +258,8 @@ class CombatEnv(gym.Env):
         if dead:
             r -= DEATH
 
-        terminated = bool(dead or cleared)
+        # 起点就已清空时不把"clear"当终止条件，避免 reset 死循环
+        terminated = bool(dead or (cleared and not self._started_clear))
 
         info = {
             "dealt": dealt, "kills": kills, "fired": fired,
