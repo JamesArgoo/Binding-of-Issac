@@ -159,16 +159,25 @@ class CombatEnv(gym.Env):
                     break
         self._cmd("restart")
         self._wait(lambda st: self._alive(st), timeout=15.0)
+        # 关键：重开的房间转场会持续一会儿，紧接着发的 goto 会被吞掉 ——
+        # 实测 reset 后玩家还留在起始房间。这里先等转场结束。
+        time.sleep(0.9)
 
         # 2) 传送进一个有敌人的房间
         #    goto 造出来的房间 room.index 恒为 -3（不在楼层地图上），
-        #    所以不能拿"房间号变了"当成功标志，改成固定 settle + 等 grid 到位。
+        #    所以用"房间是否已清空"判断有没有真的进到战斗房间，不行就重发。
         variant = int(self.rng.choice(self.variants))
-        self._cmd(f"goto d.{variant}")
-        time.sleep(0.6)
-        s = self._wait(lambda st: self._alive(st) and "grid" in st, timeout=8.0)
-        if s is None:
+        s = None
+        for _ in range(5):
+            self._cmd(f"goto d.{variant}")
+            time.sleep(0.8)
             s = self._state()
+            if s and "room" in s and not s["room"]["clear"]:
+                break
+        # 等 grid 到位（地形每 15 帧刷新一次）
+        s2 = self._wait(lambda st: self._alive(st) and "grid" in st, timeout=6.0)
+        if s2 is not None:
+            s = s2
 
         # 3) 兜底
         if s is None:
