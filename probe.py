@@ -28,8 +28,20 @@ def main():
     print(f"监听 127.0.0.1:{args.port} ...")
     t0 = time.time()
     last = None
+    fps_ref = None          # (时间, frame) —— 用来测游戏实际帧率
     while time.time() - t0 < args.seconds:
         s = b.channels[args.port].state()
+        if s is not None and "frame" in s:
+            now = time.time()
+            if fps_ref is None:
+                fps_ref = (now, s["frame"])
+            else:
+                dt = now - fps_ref[0]
+                df = s["frame"] - fps_ref[1]
+                if dt >= 2.0 and df >= 0:
+                    print(f"  [{now - t0:5.1f}s] >> 游戏帧率 ≈ {df / dt:.1f} fps "
+                          f"(frame {fps_ref[1]} -> {s['frame']}, {dt:.1f}s)")
+                    fps_ref = (now, s["frame"])
         if s is not None and s is not last:
             last = s
             elapsed = time.time() - t0
@@ -44,7 +56,7 @@ def main():
                       f"HP={p['hp']} 房间type={s.get('room', {}).get('type')}")
             else:
                 print(f"[{elapsed:5.1f}s] 其他消息 keys={keys}")
-        time.sleep(0.2)
+        time.sleep(0.05)
 
     if b.channels[args.port].state() is None:
         print(f"\n{args.seconds:.0f} 秒内没有任何连接。")

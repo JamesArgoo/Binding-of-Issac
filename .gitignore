@@ -33,3 +33,10 @@ models/combat_*.zip
 models/multi_*.zip
 models/*_smoke*.zip
 room_catalog_test.json
+
+# ===== turbo 编译产物 =====
+turbo/*.dll
+turbo/*.exe
+turbo/*.log
+turbo/*.png
+turbo_targets.json
