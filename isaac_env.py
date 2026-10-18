@@ -33,16 +33,24 @@ from isaac_bridge import (IsaacBridge, get_enemies, get_enemy_projectiles, get_p
 MAX_ENEMIES = 16
 MAX_TEARS = 48
 GRID_WIN = 7  # 7x7 局部网格
-OBS_DIM = 6 + MAX_ENEMIES * 6 + MAX_TEARS * 4 + GRID_WIN * GRID_WIN + 2 + 4 * 3  # 357
+# 观测维度（借鉴 AIsaac：实体带碰撞体积/类别，子弹带高度）
+#   玩家6 + 敌人16*8 + 子弹48*5 + 网格49 + 房间2 + 门12
+OBS_DIM = 6 + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN + 2 + 4 * 3  # 437
 
 # 8 方向：0=右 1=右下 2=下 3=左下 4=左 5=左上 6=上 7=右上
 DIRS8 = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
 
-# 归一化尺度
-POS_SCALE = 500.0
+# 归一化尺度（位置改成按房间尺寸归一化，见 _room_scale）
+POS_SCALE = 500.0        # 无网格数据时的兜底房间尺寸
 VEL_SCALE = 10.0
 HP_SCALE = 12.0
 ENEMY_HP_SCALE = 50.0
+
+# 进度势（借鉴 AIsaac combat-v5 的对齐势）：Φ = -POTENTIAL_SCALE * d / POTENTIAL_DIST
+# 用 γΦ(s') − Φ(s) 鼓励接近敌人，替代"每步扣分"（每步扣分会逼 AI 无意义绕圈）
+POTENTIAL_SCALE = 0.3
+POTENTIAL_DIST = 300.0
+GAMMA = 0.99
 
 
 def _clip(v, lo=-10.0, hi=10.0):
@@ -102,45 +110,65 @@ def cell_walkable(gx, gy, grid):
     return grid["cells"][gy * grid["w"] + gx] == 1
 
 
+def _room_scale(grid):
+    """房间在世界坐标里的宽、高、左上角（借鉴 AIsaac：按房间尺寸归一化，而不是固定 /500）。"""
+    if grid is not None and "ox" in grid and "tw" in grid and "th" in grid:
+        rw = max(grid["w"] * grid["tw"], 1.0)
+        rh = max(grid["h"] * grid["th"], 1.0)
+        return rw, rh, grid["ox"], grid["oy"]
+    return POS_SCALE, POS_SCALE, 0.0, 0.0
+
+
 def build_obs(state, grid):
-    """把一帧状态压成固定长度观测向量。"""
+    """把一帧状态压成固定长度观测向量。
+
+    相比旧版（借鉴 AIsaac observation.rs 的实体特征设计）：
+      * 位置按房间真实尺寸归一化（0~1），不再用固定 /500
+      * 敌人额外带碰撞体积 size 和碰撞类别 coll（判断接触威胁）
+      * 子弹额外带高度 height（抛射/越障弹需要）
+    """
     obs = []
     p = state["player"]
+    rw, rh, ox, oy = _room_scale(grid)
+
     # 玩家
-    obs.append(_clip(p["x"] / POS_SCALE))
-    obs.append(_clip(p["y"] / POS_SCALE))
+    obs.append(_clip((p["x"] - ox) / rw))
+    obs.append(_clip((p["y"] - oy) / rh))
     obs.append(_clip(p["vx"] / VEL_SCALE))
     obs.append(_clip(p["vy"] / VEL_SCALE))
     obs.append(_clip((p["hp"] + p["soul_hp"]) / HP_SCALE))
     obs.append(1.0 if p["hp"] > 0 else 0.0)
 
-    # 敌人（按距离排序，取最近的 MAX_ENEMIES 个）
+    # 敌人（按距离排序，取最近的 MAX_ENEMIES 个；每个 8 维）
     enemies = get_enemies(state)
     enemies.sort(key=lambda e: (e["x"] - p["x"]) ** 2 + (e["y"] - p["y"]) ** 2)
     for i in range(MAX_ENEMIES):
         if i < len(enemies):
             e = enemies[i]
-            obs.append(_clip((e["x"] - p["x"]) / POS_SCALE))
-            obs.append(_clip((e["y"] - p["y"]) / POS_SCALE))
+            obs.append(_clip((e["x"] - p["x"]) / rw))
+            obs.append(_clip((e["y"] - p["y"]) / rh))
             obs.append(_clip(e["vx"] / VEL_SCALE))
             obs.append(_clip(e["vy"] / VEL_SCALE))
             obs.append(_clip(e["hp"] / ENEMY_HP_SCALE))
             obs.append(1.0 if e["boss"] else 0.0)
+            obs.append(_clip(e.get("size", 10.0) / 40.0))   # 碰撞体积（一格 40 单位）
+            obs.append(_clip(e.get("coll", 0) / 5.0))        # 碰撞类别
         else:
-            obs.extend([0.0] * 6)
+            obs.extend([0.0] * 8)
 
-    # 子弹（泪/激光/刀/投射物 type 2/7/8/9，全部），确保弹幕能被观测到
+    # 子弹（泪/激光/刀/投射物，每个 5 维，含高度）
     tears = get_enemy_projectiles(state)
     tears.sort(key=lambda t: (t["x"] - p["x"]) ** 2 + (t["y"] - p["y"]) ** 2)
     for i in range(MAX_TEARS):
         if i < len(tears):
             t = tears[i]
-            obs.append(_clip((t["x"] - p["x"]) / POS_SCALE))
-            obs.append(_clip((t["y"] - p["y"]) / POS_SCALE))
+            obs.append(_clip((t["x"] - p["x"]) / rw))
+            obs.append(_clip((t["y"] - p["y"]) / rh))
             obs.append(_clip(t["vx"] / VEL_SCALE))
             obs.append(_clip(t["vy"] / VEL_SCALE))
+            obs.append(_clip(t.get("height", 0.0) / 40.0))   # 泪弹高度
         else:
-            obs.extend([0.0] * 4)
+            obs.extend([0.0] * 5)
 
     # 玩家周围 7x7 可行走网格
     if grid is not None and p.get("grid_idx") is not None:
@@ -196,6 +224,7 @@ class IsaacEnv(gym.Env):
         self.prev_clear = False
         self.prev_room_index = None
         self.last_state = None
+        self.prev_phi = 0.0  # 进度势的上一帧值（借鉴 AIsaac 的势函数）
 
     # ---------- 工具 ----------
     def _alive(self, s):
@@ -229,6 +258,7 @@ class IsaacEnv(gym.Env):
         self.prev_hp = p["hp"] + p["soul_hp"]
         self.prev_enemy_hp = {e["id"]: e["hp"] for e in get_enemies(s)}
         self.prev_clear = s["room"]["clear"]
+        self.prev_phi = 0.0
         return build_obs(s, self.grid), {}
 
     def step(self, action):
@@ -297,12 +327,16 @@ class IsaacEnv(gym.Env):
         if room_changed:
             reward += 5.0
 
-        # 清房后还乱射：小惩罚（教它没事别射）
-        if s["room"]["clear"] and shoot_a != 8:
-            reward -= 0.01
-
-        # 每帧小惩罚
-        reward -= 0.005
+        # 进度势（借鉴 AIsaac combat-v5）：Φ = -POTENTIAL_SCALE * d / POTENTIAL_DIST
+        # 用 γΦ(s') − Φ(s) 鼓励接近敌人；不再有"每步扣分"（那会逼 AI 无意义绕圈）
+        enemies = get_enemies(s)
+        if enemies:
+            d = min(math.hypot(e["x"] - p["x"], e["y"] - p["y"]) for e in enemies)
+            phi = -POTENTIAL_SCALE * d / POTENTIAL_DIST
+        else:
+            phi = 0.0
+        reward += GAMMA * phi - self.prev_phi
+        self.prev_phi = phi
 
         # 死亡
         terminated = total_hp <= 0

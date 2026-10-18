@@ -73,8 +73,9 @@ local function build_entities(room)
                 dead = e:IsDead(),
                 spawner_type = e.SpawnerType or 0,
                 grid_idx = room:GetGridIndex(e.Position),
-                size = e.Size,            -- 碰撞体积（半径）
-                height = e.Height or 0,   -- 泪弹高度（Z），非泪弹为 0
+                size = e.Size,               -- 碰撞体积（半径）
+                height = e.Height or 0,      -- 泪弹高度（Z），非泪弹为 0
+                coll = e.CollisionClass or 0,  -- 碰撞类别（EntityCollisionClass）
             }
         end
     end
