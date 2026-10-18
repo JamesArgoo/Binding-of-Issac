@@ -83,8 +83,14 @@ def list_windows():
 
 
 def isaac_windows():
-    """所有标题带 Isaac 的可见窗口。"""
-    return [w for w in list_windows() if "isaac" in w[3].lower()]
+    """所有 Isaac 游戏窗口。
+
+    必须同时按窗口类名 GLFW30 过滤 —— 只按标题里的 "isaac" 匹配会误伤：
+    实测文件资源管理器的标题「AIsaac 和 1 个其他选项卡」也含 "isaac"，
+    被当成了第 3 个游戏实例，导致"已连上 2/3"永远等不到。
+    """
+    return [w for w in list_windows()
+            if w[2] == "GLFW30" and "isaac" in w[3].lower()]
 
 
 def windows_for_pid(pid):
