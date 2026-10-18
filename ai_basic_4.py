@@ -201,17 +201,25 @@ def _go_to_door(state, grid, last_door=None, recent=None):
     def _ng(d):
         return _neighbor_room_grid(room_grid, d.get("slot", -1))
 
-    # 第一层：邻居房间从没去过
-    fresh = [d for d in open_doors if visited.get(_ng(d), 1) == 0]
-    # 第二层：排除最近去过的房间（治 A-B-A-B 打转 ——
-    #         尤其当 B 是只有一扇门的死胡同时，会 84<->85 无限循环）
+    # 按"邻居房间被访问过几次"打分选门 —— 这就是记忆性：
+    #   去过越多次的房间越不去（0 次 = 没去过，最优先）
+    #   最近刚去过的房间强烈回避（治 A-B-A-B 打转）
+    #   刚走过来的那扇门也回避
+    # 这样即使 B 是只有一扇门的死胡同，去过几次后 visit 变大，就不再反复进去了。
     recent_set = set(recent or [])
-    not_recent = [d for d in open_doors if _ng(d) not in recent_set]
-    # 第三层：避开刚走过来的那扇门
-    not_last = [d for d in open_doors if d["grid"] != last_door]
 
-    candidates = fresh or not_recent or not_last or open_doors
-    best = min(candidates, key=gdist)
+    def _door_score(d):
+        ng = _ng(d)
+        v = visited.get(ng, 0)
+        pen = 0
+        if ng in recent_set:
+            pen += 100
+        if d["grid"] == last_door:
+            pen += 50
+        return (v + pen, gdist(d))
+
+    candidates = list(open_doors)
+    best = min(candidates, key=_door_score)
     path = astar(grid, p["grid_idx"], best["grid"])
     if path and len(path) >= 2:
         cur, nxt = path[0], path[1]
@@ -329,7 +337,7 @@ def plan_move(state, grid, p, target, enemies, projectiles, debug=None):
     return best_dir
 
 
-def _fallback_move(state, grid, p):
+def _fallback_move(state, grid, p, enemies=None, projectiles=None):
     """兜底方向：绝不返回 (0,0)。
 
     原来 _go_to_door 在"房间没清空 / 门没开 / 已站在门上"时会返回 (0,0)，
@@ -340,21 +348,23 @@ def _fallback_move(state, grid, p):
         return (0, 0)
     w, h = grid["w"], grid["h"]
     gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
-    cx, cy = w // 2, h // 2
-    best, best_d = (0, 0), 1e18
+    threats = list(enemies or []) + list(projectiles or [])
+    best, best_key = None, None
     for d in DIRS8:
         if not cell_walkable(gx + d[0], gy + d[1], grid):
             continue
-        dd = abs(gx + d[0] - cx) + abs(gy + d[1] - cy)
-        if dd < best_d:
-            best, best_d = d, dd
-    if best != (0, 0):
-        return best
-    # 连中心方向都不可走：沿任意可走方向挪（含斜向）
-    for d in DIRS8:
-        if cell_walkable(gx + d[0], gy + d[1], grid):
-            return d
-    return (0, 0)
+        # 这一步走完之后的预想世界坐标（一格 40 单位）
+        nx = p["x"] + d[0] * 40.0
+        ny = p["y"] + d[1] * 40.0
+        to_center = abs(gx + d[0] - w // 2) + abs(gy + d[1] - h // 2)
+        if threats:
+            dmin = min(math.hypot(t["x"] - nx, t["y"] - ny) for t in threats)
+            key = (-dmin, to_center)      # 离威胁越远越好，其次靠中心
+        else:
+            key = (0.0, to_center)
+        if best_key is None or key < best_key:
+            best, best_key = d, key
+    return best if best is not None else (0, 0)
 
 
 def decide(state, grid, last_door=None, debug=None, recent=None):
@@ -368,7 +378,7 @@ def decide(state, grid, last_door=None, debug=None, recent=None):
         move = _go_to_door(state, grid, last_door, recent)
         if move == (0, 0):
             # 门还没开 / 已经站在门上 —— 不允许原地发呆，朝房间中心走
-            move = _fallback_move(state, grid, p)
+            move = _fallback_move(state, grid, p, enemies, projectiles)
         if debug is not None:
             debug["target"] = None
             debug["candidates"] = []
@@ -381,7 +391,7 @@ def decide(state, grid, last_door=None, debug=None, recent=None):
     projectiles = get_enemy_projectiles(state)
     move = plan_move(state, grid, p, target, enemies, projectiles, debug=debug)
     if move == (0, 0):
-        move = _fallback_move(state, grid, p)
+        move = _fallback_move(state, grid, p, enemies, projectiles)
     if grid is not None and p.get("grid_idx") is not None and move != (0, 0):
         move = wall_steer(move[0], move[1], p["grid_idx"], grid)
 
