@@ -17,6 +17,7 @@ ai_basic_4.py —— 规则版 AI：8 方向移动 + 4 方向射击（甩泪）
 """
 import argparse
 import math
+from collections import deque
 import time
 
 import cv2
@@ -179,6 +180,32 @@ def _neighbor_room_grid(room_grid, slot):
     return room_grid + {0: -13, 1: 1, 2: 13, 3: -1}.get(slot, 0)
 
 
+def next_room_toward_unexplored(state, cur_room):
+    """在楼层图上 BFS，返回"朝最近未探索房间走的第一个房间网格号"。
+
+    楼层网格是 13x13，房间 grid 的邻居是 ±1（左右）和 ±13（上下）。
+    返回 None 表示全图都探索过了（或者地图数据缺失）。
+
+    为什么需要它：贪心地"每到一个房间就选一个门"在一条直线的房间串里
+    会退化成来回巡逻（A-B-C-D 走完一圈又回 A）。图搜索能直接给出目标方向。
+    """
+    rooms = {r["grid"]: r for r in state.get("map", [])}
+    if not rooms or cur_room not in rooms:
+        return None
+    q = deque([(cur_room, None)])
+    seen = {cur_room}
+    while q:
+        r, first = q.popleft()
+        if r != cur_room and int(rooms.get(r, {}).get("visited", 0)) == 0:
+            return first
+        for delta in (-1, 1, -13, 13):
+            nr = r + delta
+            if nr in rooms and nr not in seen:
+                seen.add(nr)
+                q.append((nr, nr if first is None else first))
+    return None
+
+
 def _go_to_door(state, grid, last_door=None, recent=None):
     """房间清空时，走到最近的开门。返回 8 方向 (mx, my)。"""
     p = get_player(state)
@@ -219,6 +246,13 @@ def _go_to_door(state, grid, last_door=None, recent=None):
         return (v + pen, gdist(d))
 
     candidates = list(open_doors)
+
+    # 【图搜索优先】BFS 到最近的未探索房间，只走通往它的那扇门
+    target_room = next_room_toward_unexplored(state, room_grid)
+    if target_room is not None:
+        toward = [d for d in open_doors if _ng(d) == target_room]
+        if toward:
+            candidates = toward
     best = min(candidates, key=_door_score)
     path = astar(grid, p["grid_idx"], best["grid"])
     if path and len(path) >= 2:
