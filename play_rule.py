@@ -74,11 +74,27 @@ def main():
             elif map_cache is not None:
                 s["map"] = map_cache
 
+            # grid 还没到就算不了门，跳过本帧（首帧常见）
+            if grid is None:
+                time.sleep(0.005)
+                continue
+
             room_idx = s["room"]["index"]
+
+            # 【修复1】先算"本帧（新房间）的最近门"
+            cur_door = teacher.nearest_open_door_grid(s, grid)
+
+            # 【修复2】原来这里缺 prev_room = room_idx，导致 prev_room 永远是 None，
+            #         整个换房间分支从来没执行过 —— last_door 恒为 None、
+            #         recent_rooms 恒为空，所有门选择逻辑全是死代码。
             if prev_room is not None and room_idx != prev_room:
-                last_door = prev_door
-                recent_rooms.append(room_idx)   # 只在换房间时记录，否则队列被当前房间刷满
-            prev_door = teacher.nearest_open_door_grid(s, grid)
+                # 刚跨门那一帧人紧贴入口门，cur_door 就是入口门 ✅
+                # （原来 last_door = prev_door 拿的是旧房间坐标，换房间后无意义，
+                #   所以"别从入口门回去"永远匹配不到 → 每帧选最近的门 → A<->B 横跳）
+                last_door = cur_door
+                recent_rooms.append(room_idx)
+            prev_room = room_idx
+            prev_door = cur_door
 
             mx, my, ax, ay = teacher.decide(s, grid, last_door, recent=recent_rooms)
             kc.set_move(mx, my)
