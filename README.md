@@ -139,6 +139,39 @@ time = -(2.0 + (0.5 - 2.0) * 命中率) * 秒数
 - `room_catalog.py`：探测哪些 `goto d.<variant>` 真的会加载出有敌人的房间
   （模仿 `abplus_room_catalog.py`），把可用房间存成 JSON 供训练随机抽
 
+### 训练管线（已跑通）
+
+```bash
+# 1) 探房间：找出哪些 goto d.<variant> 真的会加载出敌人（一次性，约 4 分钟）
+#    实测 1201 个编号里挑出 624 个战斗房间
+python room_catalog.py --min 0 --max 1200 --out room_catalog.json
+
+# 2) 环境自检：确认能进战斗房间、能发弹、有伤害/命中/受伤信号
+python test_combat.py --steps 150
+
+# 3) 多开并行训练（单房间战斗，2 实例约 49 步/秒）
+python train_multi.py --attach --combat --steps 20000
+```
+
+自检正常输出长这样：
+
+```
+reset 1.8s → 进到 variant=986 的战斗房间（5 个敌人，未清空）
+AI 在射击（我方泪=2）  被敌人打（HP 6→4）  命中率 0.065
+清房次数 0  死亡次数 0
+```
+
+### 时序坑（全部实测踩过）
+
+- **`restart` 之后的房间转场会持续一会儿，紧接着发的 `goto` 会被吞掉**
+  → reset 后玩家还留在起始房间。必须等转场结束再发 goto。
+- **`goto` 造出来的房间 `room.index` 恒为 -3**（不在楼层地图上），
+  所以不能用"房间号变了"判断 goto 是否成功 → 改用"房间是否已清空"判断，不行就重发。
+- **玩家一旦进入死亡结算画面，`Isaac.ExecuteCommand("restart")` 就彻底失效**，
+  会永远卡在 game over。必须在 `IsDead()` 刚为真时就重开，并每秒重试。
+- 探测/训练时如果不主动操作，玩家会被敌人打死（没有 AIsaac 那种 `AbpSetInvincible`），
+  所以靠上面的自动重开来续命。
+
 ## 相关文件
 
 | 文件 | 作用 |
