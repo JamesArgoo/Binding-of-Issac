@@ -179,7 +179,7 @@ def _neighbor_room_grid(room_grid, slot):
     return room_grid + {0: -13, 1: 1, 2: 13, 3: -1}.get(slot, 0)
 
 
-def _go_to_door(state, grid, last_door=None):
+def _go_to_door(state, grid, last_door=None, recent=None):
     """房间清空时，走到最近的开门。返回 8 方向 (mx, my)。"""
     p = get_player(state)
     if grid is None or p.get("grid_idx") is None:
@@ -197,11 +197,20 @@ def _go_to_door(state, grid, last_door=None):
     # 永远遇不到敌人（录了4分钟只走了2个房间）。
     room_grid = state["room"]["index"]
     visited = {r["grid"]: r["visited"] for r in state.get("map", [])}
-    fresh = [d for d in open_doors
-             if visited.get(_neighbor_room_grid(room_grid, d.get("slot", -1)), 1) == 0]
 
-    # 其次：避开上一次走过的门，减少原地横跳
-    candidates = fresh or ([d for d in open_doors if d["grid"] != last_door] or open_doors)
+    def _ng(d):
+        return _neighbor_room_grid(room_grid, d.get("slot", -1))
+
+    # 第一层：邻居房间从没去过
+    fresh = [d for d in open_doors if visited.get(_ng(d), 1) == 0]
+    # 第二层：排除最近去过的房间（治 A-B-A-B 打转 ——
+    #         尤其当 B 是只有一扇门的死胡同时，会 84<->85 无限循环）
+    recent_set = set(recent or [])
+    not_recent = [d for d in open_doors if _ng(d) not in recent_set]
+    # 第三层：避开刚走过来的那扇门
+    not_last = [d for d in open_doors if d["grid"] != last_door]
+
+    candidates = fresh or not_recent or not_last or open_doors
     best = min(candidates, key=gdist)
     path = astar(grid, p["grid_idx"], best["grid"])
     if path and len(path) >= 2:
@@ -348,7 +357,7 @@ def _fallback_move(state, grid, p):
     return (0, 0)
 
 
-def decide(state, grid, last_door=None, debug=None):
+def decide(state, grid, last_door=None, debug=None, recent=None):
     """返回 (移动x, 移动y, 射击x, 射击y)，均为 8 方向 {-1,0,1}。"""
     p = get_player(state)
     target, enemies = choose_target(state, p)
@@ -356,7 +365,7 @@ def decide(state, grid, last_door=None, debug=None):
 
     # --- 房间清空 / 无敌人：去最近的开门 ---
     if room_clear or target is None:
-        move = _go_to_door(state, grid, last_door)
+        move = _go_to_door(state, grid, last_door, recent)
         if move == (0, 0):
             # 门还没开 / 已经站在门上 —— 不允许原地发呆，朝房间中心走
             move = _fallback_move(state, grid, p)

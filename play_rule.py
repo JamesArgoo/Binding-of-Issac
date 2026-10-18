@@ -9,6 +9,7 @@
 """
 import argparse
 import sys
+from collections import deque
 import time
 
 try:
@@ -49,6 +50,7 @@ def main():
 
     grid = None
     map_cache = None   # 模组每 30 帧才发一次 map，必须自己缓存住
+    recent_rooms = deque(maxlen=5)   # 最近去过的房间（防 A-B-A-B 打转）
     last_door = None
     prev_room = None
     prev_door = None
@@ -75,10 +77,10 @@ def main():
             room_idx = s["room"]["index"]
             if prev_room is not None and room_idx != prev_room:
                 last_door = prev_door
-            prev_room = room_idx
+                recent_rooms.append(room_idx)   # 只在换房间时记录，否则队列被当前房间刷满
             prev_door = teacher.nearest_open_door_grid(s, grid)
 
-            mx, my, ax, ay = teacher.decide(s, grid, last_door)
+            mx, my, ax, ay = teacher.decide(s, grid, last_door, recent=recent_rooms)
             kc.set_move(mx, my)
             kc.set_shoot(ax, ay)
 
