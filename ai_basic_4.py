@@ -375,6 +375,8 @@ def decide(state, grid, last_door=None, debug=None, recent=None):
 
     # --- 房间清空 / 无敌人：去最近的开门 ---
     if room_clear or target is None:
+        # 兜底走路时也要能躲子弹，所以这里先取一次敌方子弹
+        projectiles = get_enemy_projectiles(state)
         move = _go_to_door(state, grid, last_door, recent)
         if move == (0, 0):
             # 门还没开 / 已经站在门上 —— 不允许原地发呆，朝房间中心走
