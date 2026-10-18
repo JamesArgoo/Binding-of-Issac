@@ -172,16 +172,84 @@ AI 在射击（我方泪=2）  被敌人打（HP 6→4）  命中率 0.065
 - 探测/训练时如果不主动操作，玩家会被敌人打死（没有 AIsaac 那种 `AbpSetInvincible`），
   所以靠上面的自动重开来续命。
 
+### 训练结果（combat_v2，30 万步 / 2.07 小时）
+
+| 指标 | 结果 |
+|---|---|
+| **清房率** | 4/8 = **50%** |
+| 存活率 | 4/8 = 50% |
+| 平均回合长度 | 263 步 |
+| 平均伤害 | 28 |
+| 平均奖励 | **+1.13** |
+
+训练曲线：`ep_rew_mean` 低谷 -0.5 → **+0.66**；`entropy_loss` -3.8 → -2.5（策略收敛）；
+`ep_len` 447 → 375（清房更快，而时间是扣分的）。从"随机乱走"到"一半房间能清掉"。
+
+```bash
+python eval_combat.py --model models/combat_v2.zip --episodes 10
+```
+
+### 课程学习（可选，降低方差）
+
+房间难度差异很大（敌人数 1~10），全难度混训会让奖励噪声很大。实测分布：
+1~2 敌 82 个、1~3 敌 160 个、3~6 敌 323 个、6+ 敌 302 个、全难度 624 个。
+
+```bash
+# 先只练 1~3 个敌人的房间
+python train_multi.py --attach --combat --max-enemies 3 --steps 100000
+
+# 练稳了再放开到全难度
+python train_multi.py --attach --combat --steps 300000 --load models/xxx.zip --resume
+```
+
+### 待办
+
+- [x] 多开并行训练（2 实例 49 步/秒 → 实测 40 步/秒含 reset）
+- [x] 单房间战斗管线 + AIsaac 式奖励
+- [x] 规则AI 两个致命 bug（门不可走 / 卡在门上）
+- [x] 房间目录 624 个 + 评估脚本
+- [ ] **危险地面进观测**（火堆/尖刺的接触伤害）—— 改模组，需重启游戏
+- [ ] 课程学习跑一轮（先易后难）
+- [ ] action chunking（一次预测 4 步动作序列，借鉴 ACT）
+
+### 关于"模仿学习三代"那篇文章的结论
+
+知乎那篇讲 BC → ACT → Diffusion Policy 的文章，最值钱的实验数据是 action chunking 的消融：
+
+| 配置 | 成功率 |
+|---|---|
+| 完整 ACT | 44% |
+| 去掉 CVAE | 2% |
+| **chunk size = 1（单步）** | **1%** |
+| chunk size = 100 | 44% |
+
+判断：
+
+- **action chunking 值得借**——我现在是"一次决策重复 2 帧"，是退化的 chunk。
+  改成 chunk=4（一段不同动作序列）能缩短有效决策步数（信用分配更容易）、让动作更平滑、减少 Python 往返。
+  但 chunk 必须小：ACT 自己测出 chunk=400 反应性就掉了，躲弹幕要快。
+- **ACT / Diffusion Policy 本体不适合现在**——它们是模仿学习，必须有优质示范；
+  手上最好的示范源是规则AI，克隆它等于把天花板设在规则AI。Diffusion 还有 100ms 推理延迟。
+- **顺带印证**：文章讲的 BC `covariate shift` 正是之前人类 BC "像随机操作"的原因，
+  所以当时放弃纯 BC 的判断是对的。
+
+
+
 ## 相关文件
 
 | 文件 | 作用 |
 |---|---|
 | `multi_instance.py` | 多开核心：PostMessage 控制器 + 多端口桥接 + 实例管理器 + 端口对号 |
 | `train_multi.py` | **多开并行训练**：N 个实例同时采样，PPO 一起学 |
+| `combat_env.py` | **单房间战斗环境**（AIsaac 式奖励 + 9×5 动作） |
+| `room_catalog.py` | 探测哪些 `goto d.<variant>` 真的会加载出敌人 |
+| `eval_combat.py` | 量化评估：清房率 / 存活率 / 伤害 / 命中率 |
+| `test_combat.py` | 单房间战斗环境自检 |
+| `diag_ai.py` | 规则AI 决策诊断（`--watch` 高速观测，避免采样混叠） |
 | `test_multi.py` | 多开验证脚本（启动/接管 N 实例 → 等对局 → 对号 → 注入测试） |
 | `test_inject.py` | 对已开着的游戏单独测 PostMessage 注入（焦点内 / 失焦） |
 | `probe.py` | 探针：只听某个端口，确认模组 socket 通路是否正常 |
-| `isaac_ai_bridge/main.lua` | 桥接模组，支持端口段 + 掉线守住原端口 + 死亡自动重开 |
+| `isaac_ai_bridge/main.lua` | 桥接模组：端口段 + 双向命令通道 + 死亡自动重开 |
 
 ## 吞吐实测
 
@@ -218,12 +286,3 @@ python train_multi.py --launch 3 --load models/isaac_ppo_bc --steps 200000
   正常关窗（游戏自己保存）没问题。
 - 万一存档没了：同目录下 `YYYYMMDD.rep_persistentgamedataN.dat` 是历史备份，
   头部都是 `ISAACNGSAVE09R`，可以直接改回正式文件名恢复。
-
-## 待办
-
-- [x] 把多开接进训练脚本：N 个 `IsaacEnv` 并行采样（`train_multi.py`，2 实例 49 步/秒）
-- [x] 存档串写风险：确认可按弃用处理，训练用全新存档（用户确认）
-- [ ] 重新实现 `record_bc.py`，用规则AI当老师录 BC 数据 → BC 热启动 → RL 微调
-- [ ] 评估精简 mods 目录能提速多少（mods 路径相对 cwd）
-- [ ] 试 `VSync=0` 看单实例能否跑超 60fps
-- [ ] 多开规模上限实测（4/6/8 实例的步/秒曲线）

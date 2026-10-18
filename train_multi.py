@@ -119,14 +119,61 @@ class ParallelIsaacVecEnv(VecEnv):
                 for i in self._resolve(indices)]
 
 
-def build_envs(mgr):
-    """用管理器里的实例构造环境列表。"""
+def load_variants(path, min_enemies=None, max_enemies=None):
+    """从 room_catalog.py 探出的目录里取有敌人的房间 variant 列表。
+
+    min/max_enemies 用来做**课程学习**：先只练 1~3 个敌人的房间降低方差，
+    练稳了再放开到全难度（AIsaac 的 TaskSampler 也是按权重分难度的思路）。
+    """
+    import json
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    combat = data.get("combat") or []
+    picked = []
+    for r in combat:
+        n = int(r.get("n_enemies", 0))
+        if n <= 0:
+            continue
+        if min_enemies is not None and n < min_enemies:
+            continue
+        if max_enemies is not None and n > max_enemies:
+            continue
+        picked.append(int(r["variant"]))
+    variants = sorted(set(picked))
+    if not variants:
+        raise SystemExit(
+            f"{path} 里没有符合条件的房间（min={min_enemies} max={max_enemies}），"
+            f"先跑 room_catalog.py 或放宽条件")
+    return variants
+
+
+def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
+               min_enemies=None, max_enemies=None):
+    """用管理器里的实例构造环境列表。
+
+    combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
+    否则用旧的整层楼环境。
+    """
+    if combat:
+        from combat_env import CombatEnv
+        variants = load_variants(catalog, min_enemies, max_enemies)
+        rng = ""
+        if min_enemies is not None or max_enemies is not None:
+            rng = f"（敌人数 {min_enemies or 0}~{max_enemies or '∞'} 的课程）"
+        print(f"单房间战斗环境：{len(variants)} 个可用房间 variant{rng}")
+    else:
+        from isaac_env import IsaacEnv
+
     envs = []
     for inst in mgr.instances:
         ch = mgr.bridge.channels[inst.port]
-        envs.append(IsaacEnv(frame_skip=2,
-                             bridge=mi.ChannelAdapter(ch),
-                             controller=inst.controller))
+        adapter = mi.ChannelAdapter(ch)
+        if combat:
+            envs.append(CombatEnv(adapter, inst.controller,
+                                  variants=variants, frame_skip=frame_skip))
+        else:
+            envs.append(IsaacEnv(frame_skip=frame_skip, bridge=adapter,
+                                 controller=inst.controller))
     return envs
 
 
@@ -141,6 +188,14 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--ent-coef", type=float, default=0.01)
     ap.add_argument("--run-timeout", type=float, default=900.0)
+    ap.add_argument("--combat", action="store_true",
+                    help="用单房间战斗环境（照 AIsaac 的设定，推荐）")
+    ap.add_argument("--catalog", default="room_catalog.json",
+                    help="room_catalog.py 探出的房间目录，--combat 时使用")
+    ap.add_argument("--min-enemies", type=int, default=None,
+                    help="课程学习：只练敌人数量 >= N 的房间")
+    ap.add_argument("--max-enemies", type=int, default=None,
+                    help="课程学习：只练敌人数量 <= N 的房间（先易后难）")
     ap.add_argument("--device", default="cpu",
                     help="MlpPolicy 用 cpu 反而更快，默认 cpu")
     ap.add_argument("--tb", default=None, help="tensorboard 日志目录（需要装 tensorboard）")
@@ -169,7 +224,9 @@ def main():
         print("需要 --attach 或 --launch N")
         return 1
 
-    envs = build_envs(mgr)
+    envs = build_envs(mgr, combat=args.combat, catalog=args.catalog,
+                      min_enemies=args.min_enemies,
+                      max_enemies=args.max_enemies)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
 
