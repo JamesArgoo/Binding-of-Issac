@@ -42,3 +42,4 @@ turbo/*.exe
 turbo/*.log
 turbo/*.png
 turbo_targets.json
+models/*.zip
