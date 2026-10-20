@@ -47,3 +47,4 @@ models/*.zip
 # 提交消息临时文件
 .commit_msg.txt
 .cm.txt
+.msg2.txt

@@ -23,7 +23,7 @@ import time
 
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 
 try:
@@ -147,7 +147,10 @@ class ParallelIsaacVecEnv(VecEnv):
                 results[i] = self.envs[i].step(self._actions[i])
             except Exception as e:      # 单个实例炸了不能拖垮整个训练
                 print(f"[vecenv] 实例{i} step 异常: {e}")
-                results[i] = (np.zeros(OBS_DIM, dtype=np.float32), 0.0, True, False, {})
+                # 用该实例自己的观测维度补零：full 模式是 1296 维，
+                # 写死 OBS_DIM（local 的 449）会让后面 np.stack 直接形状不匹配
+                n_obs = int(self.envs[i].observation_space.shape[0])
+                results[i] = (np.zeros(n_obs, dtype=np.float32), 0.0, True, False, {})
 
         threads = [threading.Thread(target=work, args=(i,)) for i in range(n)]
         for t in threads:
@@ -228,6 +231,53 @@ def load_variants(path, min_enemies=None, max_enemies=None):
             f"{path} 里没有符合条件的房间（min={min_enemies} max={max_enemies}），"
             f"先跑 room_catalog.py 或放宽条件")
     return variants
+
+
+class ProgressCallback(BaseCallback):
+    """每 N 秒打一行训练进度。
+
+    SB3 默认只在每个 PPO 迭代**结束**时打一次日志表。一次迭代 =
+    n_steps × n_envs 步，在真实游戏环境里（每秒几十步）要几十秒才出一行，
+    看起来就像训练卡死了 —— 实测 4 实例时一次迭代约 34 秒。
+
+    这个回调把「已经跑了多少步、现在多少步/秒、完成了几个回合、最近回报」
+    每 10 秒打出来，慢速实时环境也能看到进度。
+    """
+
+    def __init__(self, every=10.0):
+        super().__init__()
+        self.every = float(every)
+        self.t0 = None
+        self.last = None
+        self.episodes = 0
+        self.ep_rews = []
+
+    def _on_step(self):
+        now = time.time()
+        if self.t0 is None:
+            self.t0 = self.last = now
+            print("  （每个 PPO 迭代结束会打一张日志表；下面是滚动进度）")
+            return True
+        for info in (self.locals.get("infos") or []):
+            ep = info.get("episode")
+            if ep:
+                self.episodes += 1
+                self.ep_rews.append(float(ep.get("r", 0.0)))
+                self.ep_rews = self.ep_rews[-30:]
+        if now - self.last >= self.every:
+            dt = now - self.t0
+            rate = self.num_timesteps / max(dt, 1e-9)
+            done = self.num_timesteps
+            total = getattr(self.model, "_total_timesteps", None)
+            eta = ""
+            if total and rate > 0:
+                eta = f"  剩余约 {(total - done) / rate / 60:.1f} 分钟"
+            recent = (f"  最近回合回报 {sum(self.ep_rews) / len(self.ep_rews):+.2f}"
+                      if self.ep_rews else "")
+            print(f"  [{dt:6.0f}s] {done:>7} 步  {rate:6.1f} 步/秒  "
+                  f"完成 {self.episodes} 回合{recent}{eta}")
+            self.last = now
+        return True
 
 
 def measure_game_fps(adapter, seconds=1.5):
@@ -478,7 +528,8 @@ def main():
 
     print(f"\n==== 开始训练 {args.steps} 步（{venv.num_envs} 实例并行）====")
     t0 = time.time()
-    model.learn(total_timesteps=args.steps, callback=ckpt,
+    model.learn(total_timesteps=args.steps,
+                callback=[ckpt, ProgressCallback(every=10.0)],
                 reset_num_timesteps=not args.resume)
     dt = time.time() - t0
     model.save(args.out)
