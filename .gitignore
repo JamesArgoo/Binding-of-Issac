@@ -51,3 +51,5 @@ models/*.zip
 .m3.txt
 .m4.txt
 .m5.txt
+.m6.txt
+logs/

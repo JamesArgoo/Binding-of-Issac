@@ -316,6 +316,10 @@ class ProgressCallback(BaseCallback):
             if rs and sum(rs) > 0:
                 extra = (f"  reset {sum(rs) / len(rs):.1f}s"
                          f" / 回合 {sum(ep_len) / max(1, len(ep_len)):.0f} 步")
+            fbs = [x for x in self.training_env.get_attr("_reset_fallbacks") or []
+                   if isinstance(x, (int, float))]
+            if fbs and sum(fbs) > 0:
+                extra += f"  兜底 {int(sum(fbs))}"
         except Exception:
             pass
 
@@ -360,7 +364,8 @@ def measure_game_fps(adapter, seconds=1.5):
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                min_enemies=None, max_enemies=None, chunk=1,
                terrain_mode="local", hit_rew=None, cost_miss=None, fps=None,
-               reset_mode="restart", hurt_scale=None, fail_on_hurt=False):
+               reset_mode="restart", hurt_scale=None, fail_on_hurt=False,
+               min_hp=3.0):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -381,6 +386,7 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
     if hurt_scale is not None:
         kw["hurt_scale"] = hurt_scale
     kw["fail_on_hurt"] = bool(fail_on_hurt)
+    kw["min_hp"] = float(min_hp)
     # fail_on_hurt + keep 不相容：keep 不重开，血量会一路往下掉，
     # 于是"掉血即结束"的回合越跑越短、最后卡在濒死状态。这种组合强制整局重开。
     if fail_on_hurt and reset_mode == "keep":
@@ -434,11 +440,12 @@ def main():
     ap.add_argument("--chunk", type=int, default=1,
                     help="action chunking：一次决策输出连续 N 组动作（借鉴 ACT，建议 2~4）")
     ap.add_argument("--reset-mode", default="restart",
-                    choices=["restart", "keep"],
-                    help="restart=每回合整局重开（照 AIsaac，保证满血）；"
-                         "keep=玩家活着就只 goto 下一间房，不重开。"
-                         "实测回合只有 ~180 步（6 秒）而重开要 2-4 秒，"
-                         "keep 能省掉 30-40% 的训练时间")
+                    choices=["restart", "keep", "auto"],
+                    help="restart=每回合整局重开（照 AIsaac，保证满血，重置 4.4s）；"
+                         "keep=玩家活着就只 goto 下一间房（快，但血量跨回合累积）；"
+                         "auto=血量 >= --min-hp 就 goto、太低才重开（推荐）")
+    ap.add_argument("--min-hp", type=float, default=3.0,
+                    help="auto 模式的补血阈值：血量低于它才整局重开（默认 3）")
     ap.add_argument("--hurt-scale", type=float, default=None,
                     help="受伤惩罚倍率（默认 1.0）。--hit-rew 调到 1.0 后，一个回合"
                          "打出的伤害约 28 分、掉光血只扣 12 分，于是贴脸换血最优；"
@@ -578,6 +585,9 @@ def main():
     if args.load:
         print(f"加载模型 {args.load}")
         model = PPO.load(args.load, env=venv, device=args.device)
+        # 载入的模型会带着它自己的 verbose（BC 种子是 verbose=0），
+        # 那样 PPO 每次迭代的日志表（熵/EV/损失）就完全不打印了。
+        model.verbose = 1
         model.learning_rate = args.lr
         model.ent_coef = args.ent_coef
         if not args.resume:

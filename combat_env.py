@@ -99,7 +99,7 @@ class CombatEnv(gym.Env):
                  frame_skip=2, max_steps=None, seed=None, chunk=1,
                  terrain_mode=TERRAIN_LOCAL, fps=None,
                  hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart",
-                 hurt_scale=1.0, fail_on_hurt=False):
+                 hurt_scale=1.0, fail_on_hurt=False, min_hp=3.0):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
@@ -125,8 +125,11 @@ class CombatEnv(gym.Env):
         # "不允许受伤"的严格版：掉任何一点血就结束本回合（不给 DEATH 惩罚，
         # 因为这是课程阶段的手段，不是真死亡）。
         self.fail_on_hurt = bool(fail_on_hurt)
+        # auto 模式的补血阈值：血量低于这个值就整局重开
+        self.min_hp = float(min_hp)
         self.last_reset_s = 0.0     # 上一次 reset 花了多少秒（诊断）
         self.last_ep_steps = 0      # 上一回合走了多少步（诊断）
+        self._reset_fallbacks = 0   # goto 连试 4 次都没进战斗房的次数（诊断）
         # 决策频率（步/秒）。默认假设游戏跑满 60fps；实测只有 ~30fps 时应该传 15，
         # 否则"早死"和"晚死"的奖励会完全相等（见文件顶部 FPS 的注释）。
         self.fps = float(fps) if fps else 60.0 / max(1, frame_skip)
@@ -262,11 +265,22 @@ class CombatEnv(gym.Env):
 
         # 1) 需要整局重开吗？
         #    reset_mode="restart"（默认，照 AIsaac）：每回合都重开，保证满血、楼层一致。
-        #    reset_mode="keep"   ：只要玩家还活着就不重开，直接 goto 下一间房 ——
-        #      重开一次要好几秒，而实测回合本身只有 ~180 步（6 秒），
-        #      所以重开能占掉 30~40% 的训练时间。
+        #    reset_mode="keep"   ：只要玩家还活着就不重开，直接 goto 下一间房。
+        #    reset_mode="auto"   ：血量 >= min_hp 就 goto（快，0.4s），
+        #      血量太低才 restart 补满（4.4s）。实测 restart 要重载整层楼，
+        #      是 reset 里最贵的一步；auto 让"健康回合"不付这笔钱，
+        #      同时保证回合总在接近满血下进行 —— keep 那种血量一路累积
+        #      会让回合越来越短、清房率假性崩塌。
         s = self._state()
-        if self.reset_mode != "keep" or not self._alive(s):
+        need_restart = not self._alive(s)
+        if self.reset_mode == "restart":
+            need_restart = True
+        elif self.reset_mode == "auto":
+            p = (s or {}).get("player") or {}
+            hp_now = float(p.get("hp", 0) or 0) + float(p.get("soul_hp", 0) or 0)
+            if hp_now < self.min_hp:
+                need_restart = True
+        if need_restart:
             self._cmd("restart")
             self._wait(lambda st: self._alive(st), timeout=15.0)
 
@@ -274,14 +288,23 @@ class CombatEnv(gym.Env):
         #    原来这里用固定 time.sleep(0.8) 盲等，改成轮询到"真的进了战斗房间"为止：
         #    顺利时 0.1~0.3 秒就返回，失败才退到超时。
         variant = None
+        s = None
+        ready = False
         for _ in range(4):
             variant = int(self.rng.choice(self.variants))
             self._cmd(f"goto d.{variant}")
             time.sleep(0.2)                       # 让房间转场先开始
-            if self._wait(self._combat_ready, timeout=4.0, poll=0.02) is not None:
+            s = self._wait(self._combat_ready, timeout=4.0, poll=0.02)
+            if s is not None:
+                ready = True
                 break
-        s = self._wait(lambda st: self._combat_ready(st) or self._alive(st),
-                       timeout=6.0, poll=0.02)
+        if not ready:
+            # 兜底：4 次都没进到战斗房。拿一个"活着"的状态让回合能跑，
+            # 但**必须禁用 room_left 判据**（等下 _room_idx0 设成 None）——
+            # 否则 _room_idx0 记的是起始房的 index，下一刻房间真的转场就会
+            # 被判成"死亡"，白给一个 -DEATH。实测这会造成 3 步就结束的假回合。
+            s = self._wait(lambda st: self._alive(st), timeout=6.0, poll=0.02)
+            self._reset_fallbacks += 1
 
         # 3) 兜底
         if s is None:
@@ -298,7 +321,9 @@ class CombatEnv(gym.Env):
         self._prev_clear = bool(s.get("room", {}).get("clear"))
         # 开局的房间索引：goto 出来的战斗房恒为 -3。之后只要这个值变了，
         # 就说明玩家已经不在开局那个房间里了（死了被重开 / 被传走）。
-        self._room_idx0 = s.get("room", {}).get("index")
+        # 没成功进战斗房时（ready=False）设成 None —— 这时"房间发生变化"
+        # 只是 goto 迟到的转场，不能当成死亡。
+        self._room_idx0 = s.get("room", {}).get("index") if ready else None
         # 如果 goto 落到了一个本来就已清空的房间，不能立刻判 terminated，
         # 否则会陷入 reset→立即结束→reset 的死循环
         self._started_clear = self._prev_clear
