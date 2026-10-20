@@ -320,6 +320,10 @@ def main():
                     help="课程学习：只练敌人数量 <= N 的房间（先易后难）")
     ap.add_argument("--chunk", type=int, default=1,
                     help="action chunking：一次决策输出连续 N 组动作（借鉴 ACT，建议 2~4）")
+    ap.add_argument("--save-every", type=int, default=25000,
+                    help="每训练多少总步数存一个 checkpoint（默认 25000）。"
+                         "多开 + 高帧率下吞吐能到几百步/秒，按步数存会一秒一个、"
+                         "很快把硬盘塞满，用总步数而不是 vec-step 次数来算")
     ap.add_argument("--full-terrain", action="store_true",
                     help="地形铺满整间房（28×16 画布 × 可走/危险 2 通道，观测 445→1292），"
                          "而不是只看玩家周围 7×7")
@@ -463,10 +467,14 @@ def main():
     # checkpoint 名字带启动时间戳：CheckpointCallback 的计数每次训练都从 0 开始，
     # 只用 "multi" 前缀会让新训练**静默覆盖**上一次的同名 checkpoint
     # （实测：10/20 那次把 10/18 的 multi_5000..45000 全盖掉了）。
+    # save_freq 的单位是「vec-step 调用次数」，所以要用总步数 // num_envs。
     run_tag = time.strftime("r%m%d-%H%M")
-    ckpt = CheckpointCallback(save_freq=max(5000 // max(1, venv.num_envs), 500),
+    save_freq = max(args.save_every // max(1, venv.num_envs), 100)
+    ckpt = CheckpointCallback(save_freq=save_freq,
                               save_path="models",
                               name_prefix=f"multi_{run_tag}")
+    print(f"checkpoint：每 {args.save_every} 总步（{save_freq} vec-step）存一次，"
+          f"前缀 models/multi_{run_tag}_")
 
     print(f"\n==== 开始训练 {args.steps} 步（{venv.num_envs} 实例并行）====")
     t0 = time.time()
