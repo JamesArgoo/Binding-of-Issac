@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
@@ -47,7 +48,8 @@ from matplotlib.patches import Rectangle
 
 try:
     import isaac_data as D
-    from isaac_env import OBS_DIM
+    from isaac_env import (CANVAS_H, CANVAS_W, TERRAIN_FULL, TERRAIN_LOCAL,
+                           obs_dim)
 except ImportError as exc:
     print(f"\n✗ {exc}", file=sys.stderr)
     sys.exit(1)
@@ -63,8 +65,8 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 CAT_CMAP = ListedColormap(list(D.CAT_COLORS))
 VISION_CMAP = ListedColormap(["#5c1a1a", "#d98c26", "#8fc98f"])   # 0 / 0.5 / 1
-GROUP_COLORS = {k: c for k, _n, _d, c in D.OBS_GROUPS}
-GROUP_NAMES = {k: n for k, n, _d, _c in D.OBS_GROUPS}
+# full 模式：0=走不了/界外 1=可走 2=可走但危险
+CANVAS_CMAP = ListedColormap(["#3a3a44", "#e8e4dc", "#d9622b"])
 
 # head_dir/fire_dir -> 三角标记旋转角（默认 '^' 指向上）
 _DIR_ROT = {-1: 0.0, 1: 0.0, 2: -90.0, 3: 180.0, 0: 90.0}
@@ -77,6 +79,9 @@ def _triangle(rot):
 class Viewer:
     def __init__(self, args):
         self.args = args
+        self.terrain_mode = TERRAIN_FULL if getattr(args, "full_terrain", False) \
+            else TERRAIN_LOCAL
+        self.odim = obs_dim(self.terrain_mode)
         self.fig = plt.figure(figsize=(16.5, 9.6))
         gs = self.fig.add_gridspec(2, 3, width_ratios=[2.05, 0.95, 1.35],
                                    height_ratios=[1.0, 0.62],
@@ -154,13 +159,14 @@ class Viewer:
         p = state.get("player", {})
         px, py = to_grid(p.get("x", 0), p.get("y", 0))
 
-        # 7×7 地形视野框
-        gx, gy = int(px), int(py)
-        r = D.GRID_WIN // 2
-        ax.add_patch(Rectangle((gx - r, gy - r), D.GRID_WIN, D.GRID_WIN,
-                               fill=False, lw=1.8, ls="--", ec="#000000", zorder=6))
-        ax.text(gx - r + 0.1, gy - r - 0.25, "AI 的地形视野 7×7",
-                fontsize=7.5, color="#000000", zorder=7)
+        # 7×7 地形视野框（只在 local 模式下画；full 模式整间房都看得见，画框会误导）
+        if self.terrain_mode != TERRAIN_FULL:
+            gx, gy = int(px), int(py)
+            r = D.GRID_WIN // 2
+            ax.add_patch(Rectangle((gx - r, gy - r), D.GRID_WIN, D.GRID_WIN,
+                                   fill=False, lw=1.8, ls="--", ec="#000000", zorder=6))
+            ax.text(gx - r + 0.1, gy - r - 0.25, "AI 的地形视野 7×7",
+                    fontsize=7.5, color="#000000", zorder=7)
 
         for e in state.get("entities", []):
             t = int(e.get("type", 0))
@@ -204,10 +210,24 @@ class Viewer:
         ax.set_title(f"① 世界俯视图（人类视角）{w}×{h}", fontsize=11)
 
     # ------------------------------------------------------------ AI 地形视野
-    def draw_vision(self, blocks):
+    def draw_vision(self, blocks, grid=None):
         ax = self.ax_vision
         ax.clear()
         win = blocks["grid"]
+        if self.terrain_mode == TERRAIN_FULL:
+            walk_ch, haz_ch = win[0], win[1]
+            cat = np.where(haz_ch > 0.5, 2, np.where(walk_ch > 0.5, 1, 0))
+            ax.imshow(cat, cmap=CANVAS_CMAP, vmin=-0.5, vmax=2.5,
+                      interpolation="nearest")
+            if grid:      # 标出房间真实边界（画布其余部分是界外填充）
+                ax.add_patch(Rectangle((-0.5, -0.5), grid["w"], grid["h"],
+                                       fill=False, lw=1.2, ls=":",
+                                       ec="#00c8ff", zorder=5))
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f"② AI 的地形视野\n整间房 {CANVAS_W}×{CANVAS_H}"
+                         f"×2通道=896维", fontsize=10.0)
+            return
         ax.imshow(win, cmap=VISION_CMAP, vmin=-0.25, vmax=1.25,
                   interpolation="nearest")
         r = D.GRID_WIN // 2
@@ -220,7 +240,7 @@ class Viewer:
         ax.plot([r], [r], marker="+", ms=10, mew=1.6, color="#0b1d33")
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_title("② AI 的地形视野\n只有这 7×7 格", fontsize=10.5)
+        ax.set_title("② AI 的地形视野\n只有这 7×7 格（49 维）", fontsize=10.0)
 
     # ------------------------------------------------------------ 敌人 / 敌弹槽
     def draw_enemy_block(self, blocks, n_enemies):
@@ -270,41 +290,44 @@ class Viewer:
         doors = state.get("doors", [])
         door_txt = " ".join(f"{d.get('slot')}:{'开' if d.get('open') else '关'}"
                             for d in doors) or "—"
+        if self.terrain_mode == TERRAIN_FULL:
+            terr_txt = f"地形 {w}×{h} 全房间(28×16画布)"
+        else:
+            terr_txt = f"地形 {w}×{h}，只看 7×7"
 
         lines = [
-            f"数据源  {mode}      游戏帧 {state.get('frame')}",
-            "",
+            f"数据源 {mode}   帧 {state.get('frame')}",
+            f"地形 {self.terrain_mode} · 观测 {self.odim} 维",
             "── 玩家 ──",
-            f"格位置 ({gxy})    血 {p.get('hp')}+{p.get('soul_hp')}魂",
+            f"格位置 ({gxy})   血 {p.get('hp')}+{p.get('soul_hp')}魂",
             f"伤害 {p.get('damage')}  射程 {p.get('tear_range')}  "
             f"泪速 {p.get('shot_speed')}",
             f"朝向 射{D.dir_name(p.get('fire_dir'))}/头{D.dir_name(p.get('head_dir'))}"
             f"   无敌帧 {p.get('iframes')}",
-            "",
             "── 房间 ──",
-            f"{D.room_type_name(room.get('type', -1))}  index {room.get('index')}  "
+            f"{D.room_type_name(room.get('type', -1))} index {room.get('index')} "
             f"{'已清空' if room.get('clear') else '战斗中'}",
             f"活敌 {room.get('enemies_alive')}  boss {room.get('bosses_alive')}",
             f"门 {door_txt}",
-            "",
             "── AI 拿到什么 ──",
-            f"观测 {nz}/{OBS_DIM} 维非零",
+            f"观测 {nz}/{self.odim} 维非零",
             f"敌人 {n_enemies}/{D.MAX_ENEMIES} 槽"
             + ("  ⚠溢出" if n_enemies > D.MAX_ENEMIES else "")
             + f"   敌弹 {n_tears}/{D.MAX_TEARS} 槽"
             + ("  ⚠溢出" if n_tears > D.MAX_TEARS else ""),
-            f"地形 {w}×{h}，只看 7×7" + ("" if grid else "  ⚠本帧无grid"),
+            terr_txt + ("" if grid else "  ⚠本帧无grid"),
         ]
         ax.text(0.0, 0.99, "\n".join(lines), va="top", ha="left",
-                fontsize=7.6, transform=ax.transAxes, linespacing=1.38)
+                fontsize=7.6, transform=ax.transAxes, linespacing=1.40)
         ax.set_title("⑤ 状态与覆盖率", fontsize=10.5)
 
     # ------------------------------------------------------------ 分块强度
     def draw_groups(self, blocks):
         ax = self.ax_groups
         ax.clear()
+        groups = D.obs_groups(self.terrain_mode)
         names, vals, ns, colors = [], [], [], []
-        for key, name, dim, color in D.OBS_GROUPS:
+        for key, name, dim, color in groups:
             blk = blocks[key]
             names.append(name)
             vals.append(float(np.mean(np.abs(blk))))
@@ -312,24 +335,23 @@ class Viewer:
             colors.append(color)
         y = np.arange(len(names))[::-1]
         ax.barh(y, vals, color=colors, height=0.62)
-        for yi, v, n, key in zip(y, vals, ns, [g[0] for g in D.OBS_GROUPS]):
-            dim = dict((k, d) for k, _n, d, _c in D.OBS_GROUPS)[key]
+        for yi, v, n, (_k, _nm, dim, _c) in zip(y, vals, ns, groups):
             ax.text(v + max(vals) * 0.02, yi, f"{v:.3f}  ({n}/{dim}非零)",
                     va="center", fontsize=7.5)
         ax.set_yticks(y)
         ax.set_yticklabels([f"{n}  {d}维" for n, (_k, _nm, d, _c)
-                            in zip(names, D.OBS_GROUPS)], fontsize=8)
+                            in zip(names, groups)], fontsize=8)
         ax.set_xlim(0, max(vals + [0.01]) * 1.55)
         ax.set_xlabel("该块内 |值| 的平均（越大 = 这块信息越强）", fontsize=8)
-        ax.set_title("⑥ 445 维的分块强度", fontsize=10.5)
+        ax.set_title(f"⑥ {self.odim} 维的分块强度", fontsize=10.5)
         ax.tick_params(labelsize=7.5)
         ax.grid(axis="x", ls=":", alpha=0.4)
 
     # ------------------------------------------------------------ 一帧
     def render(self, state, grid, mode):
         cats = D.cell_categories(state, grid) if grid else None
-        obs = D.compute_obs(state, grid)
-        blocks = D.obs_blocks(obs)
+        obs = D.compute_obs(state, grid, self.terrain_mode)
+        blocks = D.obs_blocks(obs, self.terrain_mode)
         p = state.get("player", {})
         enemies = [e for e in state.get("entities", [])
                    if e.get("enemy") or e.get("boss")]
@@ -338,7 +360,7 @@ class Viewer:
                  and int(e.get("spawner_type", 0) or 0) != 1]
 
         self.draw_world(state, grid, cats)
-        self.draw_vision(blocks)
+        self.draw_vision(blocks, grid)
         self.draw_enemy_block(blocks, len(enemies))
         self.draw_tear_block(blocks, len(tears))
         self.draw_info(state, grid, obs, blocks, len(enemies), len(tears), mode)
@@ -346,8 +368,8 @@ class Viewer:
 
         room = state.get("room", {})
         self.fig.suptitle(
-            f"以撒 AI 之眼 —— 人类的房间 vs 网络收到的 445 个数字"
-            f"    |  帧 {state.get('frame')}  "
+            f"以撒 AI 之眼 —— 人类的房间 vs 网络收到的 {self.odim} 个数字"
+            f"    |  地形 {self.terrain_mode}  帧 {state.get('frame')}  "
             f"房间 {D.room_type_name(room.get('type', -1))}  "
             f"{'已清空' if room.get('clear') else '战斗中'}",
             fontsize=13.5)
@@ -357,17 +379,57 @@ def main():
     ap = argparse.ArgumentParser(description="以撒 AI 观测可视化")
     ap.add_argument("--port", type=int, default=48532)
     ap.add_argument("--demo", action="store_true", help="用合成房间（不需要开游戏）")
+    ap.add_argument("--replay", type=str, default=None,
+                    help="回放 dump_state.py --json 存的帧文件（不需要开游戏）")
     ap.add_argument("--snapshot", type=str, default=None, help="存一张 PNG 后退出")
     ap.add_argument("--interval", type=float, default=0.12, help="刷新间隔（秒）")
     ap.add_argument("--timeout", type=float, default=60.0, help="等游戏连上来的超时")
+    ap.add_argument("--full-terrain", action="store_true",
+                    help="按全房间地形观测（28×16×2 通道，1292 维）显示，"
+                         "而不是默认的 7×7 局部（445 维）")
     args = ap.parse_args()
 
     viewer = Viewer(args)
+    feed = None
 
-    if args.demo:
+    # ---- 数据源：replay / demo / 实时 ----
+    replay_frames, replay_grids, replay_i = None, None, 0
+    if args.replay:
+        with open(args.replay, encoding="utf-8") as f:
+            data = json.load(f)
+        data = data if isinstance(data, list) else [data]
+        replay_frames = [st for st in data if "player" in st] or data
+        # 地形缓存：模组 15 帧才发一次 grid，真实环境也是这样缓存的
+        cur, replay_grids = None, []
+        for st in replay_frames:
+            if st.get("grid"):
+                cur = D.normalize_grid(dict(st["grid"]))
+            replay_grids.append(cur)
+        mode = f"回放 {args.replay}（{len(replay_frames)} 帧）"
+        print(f"[viz] 回放 {args.replay}，共 {len(replay_frames)} 帧")
+
+        def get_state(_t=0.0):
+            nonlocal replay_i
+            if args.snapshot:
+                replay_i = len(replay_frames) - 1     # 存图用最后一帧
+            else:
+                replay_i = (replay_i + 1) % len(replay_frames)
+            return replay_frames[replay_i]
+
+        def grid_for(state):
+            return replay_grids[replay_i]
+    elif args.demo:
         def get_state(_t=0.0):
             return D.demo_state(time.time())
         mode = "合成数据（--demo）"
+
+        grid_cache = {"g": None}
+
+        def grid_for(state):
+            raw = state.get("grid")
+            if raw:
+                grid_cache["g"] = D.normalize_grid(dict(raw))
+            return grid_cache["g"]
     else:
         feed = D.StateFeed(port=args.port).start()
         print(f"[viz] 监听 127.0.0.1:{args.port} ...")
@@ -381,15 +443,13 @@ def main():
             return feed.latest()
         mode = f"LIVE 127.0.0.1:{args.port}"
 
-    # 地形缓存：模组 15 帧才发一次 grid，真实环境也是这样缓存的
-    grid_cache = {"g": None, "last_raw": None}
+        grid_cache = {"g": None}
 
-    def grid_for(state):
-        raw = state.get("grid")
-        if raw:
-            grid_cache["last_raw"] = raw
-            grid_cache["g"] = D.normalize_grid(dict(raw))
-        return grid_cache["g"]
+        def grid_for(state):
+            raw = state.get("grid")
+            if raw:
+                grid_cache["g"] = D.normalize_grid(dict(raw))
+            return grid_cache["g"]
 
     if args.snapshot:
         state = get_state()
@@ -397,7 +457,7 @@ def main():
         viewer.render(state, g, mode)
         viewer.fig.savefig(args.snapshot, dpi=110)
         print(f"[viz] 已保存 {args.snapshot}")
-        if not args.demo:
+        if feed is not None:
             feed.close()
         return 0
 
@@ -408,14 +468,11 @@ def main():
     try:
         while plt.fignum_exists(viewer.fig.number):
             state = get_state()
-            if state is None:
+            if state is None or "player" not in state:
                 plt.pause(args.interval)
                 continue
             g = grid_for(state)
-            if "player" not in state:
-                plt.pause(args.interval)
-                continue
-            if state.get("frame") != last_frame or args.demo:
+            if state.get("frame") != last_frame or args.demo or args.replay:
                 last_frame = state.get("frame")
                 viewer.render(state, g, mode)
                 viewer.fig.canvas.draw_idle()
@@ -424,7 +481,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if not args.demo:
+        if feed is not None:
             feed.close()
     return 0
 

@@ -22,7 +22,10 @@ import numpy as np
 
 # 观测的真正定义在这里；本模块只做标注
 try:
-    from isaac_env import OBS_DIM, _hazard_cells, build_obs, normalize_grid
+    from isaac_env import (CANVAS_H, CANVAS_W, GRID_WIN, MAX_ENEMIES, MAX_TEARS,
+                           OBS_DIM, OBS_DIM_FULL, PLAYER_DIM, TERRAIN_CHANNELS,
+                           TERRAIN_FULL, TERRAIN_LOCAL, _hazard_cells, build_obs,
+                           normalize_grid, obs_dim, terrain_dim)
 except ImportError as _exc:                       # pragma: no cover - 环境问题
     _prefix = os.environ.get("CONDA_PREFIX")
     _hint = (f"  或者显式指定：\"{_prefix}\\python.exe\" dump_state.py\n"
@@ -137,29 +140,35 @@ def dir_name(d):
 # ---------------------------------------------------------------- 观测标签
 
 # (键, 中文名, 维度, 配色)
-OBS_GROUPS = [
-    ("player", "玩家", 14, "#4C78A8"),
-    ("enemy", "敌人", 128, "#E45756"),
-    ("tear", "敌弹", 240, "#F58518"),
-    ("grid", "地形", 49, "#54A24B"),
-    ("room", "房间", 2, "#B279A2"),
-    ("door", "门", 12, "#72B7B2"),
-]
+def obs_groups(terrain_mode=TERRAIN_LOCAL):
+    """观测分块：(键, 中文名, 维度, 配色)。地形块的维度随模式变化。"""
+    return [
+        ("player", "玩家", PLAYER_DIM, "#4C78A8"),
+        ("enemy", "敌人", MAX_ENEMIES * 8, "#E45756"),
+        ("tear", "敌弹", MAX_TEARS * 5, "#F58518"),
+        ("grid", "地形", terrain_dim(terrain_mode), "#54A24B"),
+        ("room", "房间", 2, "#B279A2"),
+        ("door", "门", 12, "#72B7B2"),
+    ]
 
-MAX_ENEMIES = 16
-MAX_TEARS = 48
-GRID_WIN = 7
+
+OBS_GROUPS = obs_groups(TERRAIN_LOCAL)      # 默认模式的兼容别名
 
 _ENEMY_FEATS = ("相对x", "相对y", "vx", "vy", "血量", "是boss", "体积", "碰撞类")
 _TEAR_FEATS = ("相对x", "相对y", "vx", "vy", "高度")
 
+_LABEL_CACHE = {}
 
-def obs_labels():
-    """返回长度 == OBS_DIM 的标签表：每一维在网络眼里叫什么。
+
+def obs_labels(terrain_mode=TERRAIN_LOCAL):
+    """返回长度 == obs_dim(terrain_mode) 的标签表：每一维在网络眼里叫什么。
 
     顺序与 `isaac_env.build_obs` 严格一致；对不上就直接抛异常，
     免得可视化跟真实观测错位还看不出来。
     """
+    if terrain_mode in _LABEL_CACHE:
+        return _LABEL_CACHE[terrain_mode]
+
     lab = [
         ("player", "玩家x"), ("player", "玩家y"), ("player", "玩家vx"), ("player", "玩家vy"),
         ("player", "血量"), ("player", "存活"),
@@ -170,60 +179,78 @@ def obs_labels():
         lab += [("enemy", f"敌{i}·{f}") for f in _ENEMY_FEATS]
     for i in range(MAX_TEARS):
         lab += [("tear", f"弹{i}·{f}") for f in _TEAR_FEATS]
-    for dy in range(-(GRID_WIN // 2), GRID_WIN // 2 + 1):
-        for dx in range(-(GRID_WIN // 2), GRID_WIN // 2 + 1):
-            lab.append(("grid", f"格{dx:+d},{dy:+d}"))
+
+    if terrain_mode == TERRAIN_FULL:
+        # 展平顺序 = 通道优先：先整张"可走"图，再整张"危险"图
+        for ch, chn in ((0, "可走"), (1, "危险")):
+            for y in range(CANVAS_H):
+                for x in range(CANVAS_W):
+                    lab.append(("grid", f"{chn}{y},{x}"))
+    else:
+        for dy in range(-(GRID_WIN // 2), GRID_WIN // 2 + 1):
+            for dx in range(-(GRID_WIN // 2), GRID_WIN // 2 + 1):
+                lab.append(("grid", f"格{dx:+d},{dy:+d}"))
+
     lab += [("room", "敌人数量"), ("room", "已清空")]
     for s in range(4):
         lab += [("door", f"门{s}·x"), ("door", f"门{s}·y"), ("door", f"门{s}·开")]
 
-    if len(lab) != OBS_DIM:
+    want = obs_dim(terrain_mode)
+    if len(lab) != want:
         raise RuntimeError(
-            f"观测标签数 {len(lab)} != OBS_DIM {OBS_DIM}："
+            f"观测标签数 {len(lab)} != obs_dim({terrain_mode})={want}："
             f"isaac_env.build_obs 改了但本模块没同步")
+    _LABEL_CACHE[terrain_mode] = lab
     return lab
 
 
-# 各块在 445 维里的切片（顺序同 build_obs）
-BLOCK_SLICES = {
-    "player": (0, 14),
-    "enemy": (14, 14 + MAX_ENEMIES * 8),
-    "tear": (14 + MAX_ENEMIES * 8, 14 + MAX_ENEMIES * 8 + MAX_TEARS * 5),
-    "grid": (14 + MAX_ENEMIES * 8 + MAX_TEARS * 5,
-             14 + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN),
-    "room": (14 + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN,
-             16 + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN),
-    "door": (16 + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN, OBS_DIM),
-}
+def block_slices(terrain_mode=TERRAIN_LOCAL):
+    """各块在观测向量里的切片（顺序同 build_obs）。"""
+    t0 = PLAYER_DIM + MAX_ENEMIES * 8 + MAX_TEARS * 5
+    t1 = t0 + terrain_dim(terrain_mode)
+    return {
+        "player": (0, PLAYER_DIM),
+        "enemy": (PLAYER_DIM, PLAYER_DIM + MAX_ENEMIES * 8),
+        "tear": (PLAYER_DIM + MAX_ENEMIES * 8, t0),
+        "grid": (t0, t1),
+        "room": (t1, t1 + 2),
+        "door": (t1 + 2, obs_dim(terrain_mode)),
+    }
 
 
-def obs_blocks(obs):
-    """把 445 维按语义切块，返回 dict：键 -> ndarray（已 reshape 成直观形状）。
+BLOCK_SLICES = block_slices(TERRAIN_LOCAL)   # 默认模式的兼容别名
+
+
+def obs_blocks(obs, terrain_mode=TERRAIN_LOCAL):
+    """把观测向量按语义切块，返回 dict：键 -> ndarray（已 reshape 成直观形状）。
 
     * enemy: (16, 8) —— 一行一个敌人槽位，一列一个特征
     * tear : (5, 48) —— 转置成一列一个弹槽位，便于横向展示
-    * grid : (7, 7)  —— 玩家为中心的局部地形
+    * grid : local=(7, 7) 玩家为中心的局部地形
+             full =(2, 16, 28) 整间房画布：ch0 可走 / ch1 危险
     """
     obs = np.asarray(obs, dtype=np.float32).ravel()
-    e0, e1 = BLOCK_SLICES["enemy"]
-    t0, t1 = BLOCK_SLICES["tear"]
-    g0, g1 = BLOCK_SLICES["grid"]
-    d0, d1 = BLOCK_SLICES["door"]
+    sl = block_slices(terrain_mode)
+    g0, g1 = sl["grid"]
+    d0, d1 = sl["door"]
+    grid = (obs[g0:g1].reshape(TERRAIN_CHANNELS, CANVAS_H, CANVAS_W)
+            if terrain_mode == TERRAIN_FULL
+            else obs[g0:g1].reshape(GRID_WIN, GRID_WIN))
     return {
-        "player": obs[slice(*BLOCK_SLICES["player"])],
-        "enemy": obs[e0:e1].reshape(MAX_ENEMIES, 8),
-        "tear": obs[t0:t1].reshape(MAX_TEARS, 5).T,
-        "grid": obs[g0:g1].reshape(GRID_WIN, GRID_WIN),
-        "room": obs[slice(*BLOCK_SLICES["room"])],
+        "player": obs[slice(*sl["player"])],
+        "enemy": obs[sl["enemy"][0]:sl["enemy"][1]].reshape(MAX_ENEMIES, 8),
+        "tear": obs[sl["tear"][0]:sl["tear"][1]].reshape(MAX_TEARS, 5).T,
+        "grid": grid,
+        "room": obs[slice(*sl["room"])],
         "door": obs[d0:d1].reshape(4, 3),
     }
 
 
-def compute_obs(state, grid):
+def compute_obs(state, grid, terrain_mode=TERRAIN_LOCAL):
     """按 isaac_env 的口径算观测；不在对局里时返回全零。"""
     if not state or "player" not in state:
-        return np.zeros(OBS_DIM, dtype=np.float32)
-    return build_obs(state, grid)
+        return np.zeros(obs_dim(terrain_mode), dtype=np.float32)
+    return build_obs(state, grid, terrain_mode)
 
 
 # ---------------------------------------------------------------- 地形分类

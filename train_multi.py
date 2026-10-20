@@ -32,7 +32,7 @@ except Exception:
     pass
 
 import multi_instance as mi
-from isaac_env import OBS_DIM, IsaacEnv
+from isaac_env import OBS_DIM, TERRAIN_FULL, TERRAIN_LOCAL, IsaacEnv, obs_dim
 
 
 class ParallelIsaacVecEnv(VecEnv):
@@ -149,11 +149,15 @@ def load_variants(path, min_enemies=None, max_enemies=None):
 
 
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
-               min_enemies=None, max_enemies=None, chunk=1):
+               min_enemies=None, max_enemies=None, chunk=1,
+               terrain_mode="local"):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
     否则用旧的整层楼环境。
+
+    terrain_mode: "local"（地形只看玩家周围 7×7，445 维）
+                  "full" （地形铺满整间房 28×16×2 通道，1292 维）
     """
     if combat:
         from combat_env import CombatEnv
@@ -172,7 +176,7 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         if combat:
             envs.append(CombatEnv(adapter, inst.controller,
                                   variants=variants, frame_skip=frame_skip,
-                                  chunk=chunk))
+                                  chunk=chunk, terrain_mode=terrain_mode))
         else:
             envs.append(IsaacEnv(frame_skip=frame_skip, bridge=adapter,
                                  controller=inst.controller))
@@ -200,6 +204,9 @@ def main():
                     help="课程学习：只练敌人数量 <= N 的房间（先易后难）")
     ap.add_argument("--chunk", type=int, default=1,
                     help="action chunking：一次决策输出连续 N 组动作（借鉴 ACT，建议 2~4）")
+    ap.add_argument("--full-terrain", action="store_true",
+                    help="地形铺满整间房（28×16 画布 × 可走/危险 2 通道，观测 445→1292），"
+                         "而不是只看玩家周围 7×7")
     ap.add_argument("--n-steps", type=int, default=1024,
                     help="PPO 每次更新收集多少步（越大 advantage 估计越稳）")
     ap.add_argument("--batch", type=int, default=256, help="PPO minibatch 大小")
@@ -250,12 +257,20 @@ def main():
         print("需要 --attach 或 --launch N")
         return 1
 
+    terrain_mode = TERRAIN_FULL if args.full_terrain else TERRAIN_LOCAL
     envs = build_envs(mgr, combat=args.combat, catalog=args.catalog,
                       min_enemies=args.min_enemies,
                       max_enemies=args.max_enemies,
-                      chunk=args.chunk)
+                      chunk=args.chunk,
+                      terrain_mode=terrain_mode)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
+    odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
+    print(f"地形模式 {terrain_mode} → 观测 {odim} 维 "
+          + ("（整间房 28×16×2 通道）" if terrain_mode == TERRAIN_FULL
+             else "（玩家周围 7×7）"))
+    # full 地形把输入从 445 拉到 1292，128 宽的两层太窄，加宽到 256
+    net_arch = [256, 256] if terrain_mode == TERRAIN_FULL else [128, 128]
 
     # ---------- 模型 ----------
     if args.load:
@@ -272,7 +287,8 @@ def main():
             n_steps=args.n_steps, batch_size=args.batch, n_epochs=10,
             gamma=0.99, gae_lambda=0.95, clip_range=0.2,
             ent_coef=args.ent_coef, learning_rate=args.lr,
-            policy_kwargs=dict(net_arch=dict(pi=[128, 128], vf=[128, 128])),
+            policy_kwargs=dict(net_arch=dict(pi=list(net_arch),
+                                             vf=list(net_arch))),
             tensorboard_log=args.tb,
             device=args.device,
             verbose=1,

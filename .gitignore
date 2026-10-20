@@ -27,6 +27,7 @@ Thumbs.db
 *.png
 savedatapath.txt
 models/smoke_*
+frames*.json
 
 # ===== 训练产物（体积大，可重训）=====
 models/combat_*.zip

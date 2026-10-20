@@ -32,7 +32,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 try:
     import isaac_data as D
-    from isaac_env import OBS_DIM
+    from isaac_env import TERRAIN_FULL, TERRAIN_LOCAL, obs_dim
 except ImportError as exc:
     print(f"\n✗ {exc}", file=sys.stderr)
     sys.exit(1)
@@ -239,16 +239,20 @@ def show_doors_map(state, map_rooms=None):
           "**没有**房间之间的连接关系，也没有楼梯位置。")
 
 
-def show_obs(state, grid, cached=False):
-    sec("⑥ AI 的输入：445 维观测（这就是网络的眼睛）")
-    obs = D.compute_obs(state, grid)
-    labels = D.obs_labels()
-    blocks = D.obs_blocks(obs)
+def show_obs(state, grid, cached=False, terrain_mode=TERRAIN_LOCAL):
+    odim = obs_dim(terrain_mode)
+    sec(f"⑥ AI 的输入：{odim} 维观测（这就是网络的眼睛）"
+        f"  地形模式={terrain_mode}")
+    obs = D.compute_obs(state, grid, terrain_mode)
+    labels = D.obs_labels(terrain_mode)
+    blocks = D.obs_blocks(obs, terrain_mode)
+    slices = D.block_slices(terrain_mode)
+    groups = D.obs_groups(terrain_mode)
     if cached:
         print("  （地形块来自缓存的上一份 grid）")
 
     rows = []
-    for key, name, dim, _color in D.OBS_GROUPS:
+    for key, name, dim, _color in groups:
         blk = blocks[key]
         nz = int(np.count_nonzero(np.abs(blk) > 1e-6))
         rows.append((f"{name}（{key}）", dim, nz,
@@ -256,7 +260,7 @@ def show_obs(state, grid, cached=False):
                      fnum(float(np.mean(np.abs(blk))), 3)))
     table(["块", "维度", "非零维数", "最小值", "最大值", "平均|值|"], rows,
           aligns=["l", "r", "r", "r", "r", "r"])
-    print(f"  合计 {OBS_DIM} 维（isaac_env.build_obs 的定义）")
+    print(f"  合计 {odim} 维（isaac_env.build_obs 的定义）")
 
     p = state.get("player", {})
     print()
@@ -294,9 +298,67 @@ def show_obs(state, grid, cached=False):
         print(f"  ⚠ 超出的 {len(tears) - D.MAX_TEARS} 个弹幕 AI 看不见")
 
     print()
-    print("  地形块（玩家为中心的 7×7，0=走不了 0.5=能走但会掉血 1=安全）：")
-    for row in blocks["grid"]:
-        print("    " + " ".join(f"{v:>4.1f}" for v in row))
+    if terrain_mode == TERRAIN_FULL:
+        print(f"  地形块（整间房铺进 {D.CANVAS_W}×{D.CANVAS_H} 画布 × 2 通道，"
+              f"1=可走/危险 0=不能走或界外）：")
+        walk_ch, haz_ch = blocks["grid"][0], blocks["grid"][1]
+        gw, gh = (int(grid["w"]), int(grid["h"])) if grid else (0, 0)
+        print(f"    房间 {gw}×{gh} 贴在画布左上角，其余 "
+              f"{D.CANVAS_W * D.CANVAS_H - min(gw, D.CANVAS_W) * min(gh, D.CANVAS_H)}"
+              f" 格是界外填充")
+        print("    '.'=可走 '!'=可走但会掉血 '#'=走不了/界外")
+        head = "      " + "".join(str(x % 10) for x in range(D.CANVAS_W))
+        print(head)
+        for y in range(D.CANVAS_H):
+            row = ""
+            for x in range(D.CANVAS_W):
+                if haz_ch[y, x] > 0.5:
+                    row += "!"
+                elif walk_ch[y, x] > 0.5:
+                    row += "."
+                else:
+                    row += "#"
+            mark = "  <-房间底" if grid and y == gh - 1 else ""
+            print(f"    {y:2d}  {row}{mark}")
+        print(f"    可走格 {int((walk_ch > 0.5).sum())} / 危险格 {int((haz_ch > 0.5).sum())}")
+        if p.get("grid_idx") is not None and gw:
+            gx, gy = int(p["grid_idx"]) % gw, int(p["grid_idx"]) // gw
+            print(f"    玩家在画布格 ({gx},{gy})，整间房都在观测里（不再有盲区）")
+    else:
+        print("  地形块（玩家为中心的 7×7，0=走不了 0.5=能走但会掉血 1=安全）：")
+        for row in blocks["grid"]:
+            print("    " + " ".join(f"{v:>4.1f}" for v in row))
+
+    # 覆盖率：房间里"有信息"的地形格有多少落在 AI 的地形视野外
+    if grid is not None and p.get("grid_idx") is not None:
+        gw, gh = grid["w"], grid["h"]
+        if terrain_mode == TERRAIN_FULL:
+            seen = min(gw, D.CANVAS_W) * min(gh, D.CANVAS_H)
+            lost = gw * gh - seen
+            print()
+            print(f"  覆盖率：房间 {gw}×{gh}={gw * gh} 格，画布可容纳 {seen} 格"
+                  f" → AI 看得到 {100.0 * seen / max(1, gw * gh):.0f}%"
+                  + (f"，仍溢出 {lost} 格（房间超出 28×16 画布！）" if lost else ""))
+        else:
+            gx, gy = int(p["grid_idx"]) % gw, int(p["grid_idx"]) // gw
+            r = D.GRID_WIN // 2
+            inside = outside = 0
+            for i, c in enumerate(grid.get("coll") or []):
+                if int(c) == 0:            # 空地不算信息
+                    continue
+                x, y = i % gw, i // gw
+                if abs(x - gx) <= r and abs(y - gy) <= r:
+                    inside += 1
+                else:
+                    outside += 1
+            tot = inside + outside
+            win = D.GRID_WIN * D.GRID_WIN
+            print()
+            print(f"  ⚠ 覆盖率：房间 {gw}×{gh}={gw * gh} 格，窗口只有 {win} 格"
+                  f"（{100.0 * win / max(1, gw * gh):.1f}%）")
+            print(f"     非空地格 {tot} 个：窗口内 {inside}，窗口外 {outside}"
+                  f" → AI 看不见 {100.0 * outside / max(1, tot):.0f}%"
+                  f"（墙/石头/坑 全在这个盲区里）。加 --full-terrain 可消除")
 
     print()
     print("  房间块 / 门块：")
@@ -307,22 +369,24 @@ def show_obs(state, grid, cached=False):
           aligns=["r", "r", "r", "r"])
 
 
-def show_stats(frames, grids):
-    sec(f"⑦ 多帧统计（{len(frames)} 帧）—— 各维真实取值范围")
+def show_stats(frames, grids, terrain_mode=TERRAIN_LOCAL):
+    odim = obs_dim(terrain_mode)
+    sec(f"⑦ 多帧统计（{len(frames)} 帧，{odim} 维）—— 各维真实取值范围")
     if len(frames) < 2:
         print("  至少要 --frames 2 才有统计")
         return
 
     obs_list = []
     for st, g in zip(frames, grids):
-        obs_list.append(D.compute_obs(st, g))
+        obs_list.append(D.compute_obs(st, g, terrain_mode))
     mat = np.stack(obs_list)
-    labels = D.obs_labels()
+    labels = D.obs_labels(terrain_mode)
+    slices = D.block_slices(terrain_mode)
 
     print("  按块统计（如果某块 min==max==0，说明这段时间它一直在喂常数 —— 相当于死输入）：")
     rows = []
-    for key, name, dim, _c in D.OBS_GROUPS:
-        lo, hi = D.BLOCK_SLICES[key]
+    for key, name, dim, _c in D.obs_groups(terrain_mode):
+        lo, hi = slices[key]
         sl = mat[:, lo:hi]
         rows.append((name, dim, fnum(sl.min(), 2), fnum(sl.max(), 2),
                      fnum(float(np.mean(np.abs(sl))), 3),
@@ -334,12 +398,12 @@ def show_stats(frames, grids):
     stds = mat.std(axis=0)
     const_idx = np.where(stds < 1e-6)[0]
     print()
-    print(f"  全程恒定的维：{len(const_idx)} / {OBS_DIM}")
+    print(f"  全程恒定的维：{len(const_idx)} / {odim}")
     if len(const_idx):
         names = {}
         for i in const_idx:
             names.setdefault(labels[i][0], []).append(labels[i][1])
-        for key, name, dim, _c in D.OBS_GROUPS:
+        for key, name, dim, _c in D.obs_groups(terrain_mode):
             if key in names:
                 show = names[key][:6]
                 more = "" if len(names[key]) <= 6 else f" …共{len(names[key])}维"
@@ -350,7 +414,13 @@ def show_stats(frames, grids):
 
 
 def capture(args):
-    """取帧：返回 (frames, feed, elapsed)。demo 模式即时生成。"""
+    """取帧：返回 (frames, feed, elapsed)。demo / replay 模式即时生成。"""
+    if getattr(args, "replay", None):
+        with open(args.replay, encoding="utf-8") as f:
+            data = json.load(f)
+        frames = data if isinstance(data, list) else [data]
+        return frames, None, 0.0
+
     if args.demo:
         t0 = time.time()
         frames = []
@@ -419,8 +489,14 @@ def main():
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--json", type=str, default=None, help="把这些帧的原始 JSON 存到文件")
     ap.add_argument("--demo", action="store_true", help="不连游戏，用合成数据看效果")
+    ap.add_argument("--replay", type=str, default=None,
+                    help="回放之前 --json 存的帧文件，不用连游戏")
     ap.add_argument("--quiet", action="store_true", help="只打印观测部分")
+    ap.add_argument("--full-terrain", action="store_true",
+                    help="按全房间地形观测（28×16×2 通道，1292 维）打印，"
+                         "而不是默认的 7×7 局部（445 维）")
     args = ap.parse_args()
+    terrain_mode = TERRAIN_FULL if args.full_terrain else TERRAIN_LOCAL
 
     frames, feed, elapsed = capture(args)
     if not frames:
@@ -446,9 +522,9 @@ def main():
         show_entities(state)
         show_grid(state, grid, cached=cached)
         show_doors_map(state, map_rooms)
-    show_obs(state, grid, cached=cached)
+    show_obs(state, grid, cached=cached, terrain_mode=terrain_mode)
     if len(frames) > 1:
-        show_stats(frames, grids)
+        show_stats(frames, grids, terrain_mode=terrain_mode)
 
     if feed is not None:
         feed.close()

@@ -29,7 +29,8 @@ import numpy as np
 from gymnasium import spaces
 
 from isaac_bridge import get_enemies, get_player
-from isaac_env import OBS_DIM, build_obs, cell_walkable, normalize_grid
+from isaac_env import (TERRAIN_FULL, TERRAIN_LOCAL, build_obs, cell_walkable,
+                       normalize_grid, obs_dim)
 
 # ---- 动作：移动 0-7 = DIRS8 八方向，8 = 停；射击 0 = 不射，1=上 2=右 3=下 4=左 ----
 DIRS8 = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
@@ -90,12 +91,16 @@ class CombatEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, bridge, controller, variants=(12, 13, 14),
-                 frame_skip=2, max_steps=None, seed=None, chunk=1):
+                 frame_skip=2, max_steps=None, seed=None, chunk=1,
+                 terrain_mode=TERRAIN_LOCAL):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
         self.variants = list(variants) or [12]
         self.frame_skip = frame_skip
+        # 地形编码：local = 玩家周围 7×7（445 维）；full = 整间房 28×16×2 通道（1292 维）
+        self.terrain_mode = terrain_mode
+        self.obs_dim = obs_dim(terrain_mode)
         # action chunking（借鉴 ACT）：一次决策输出连续 chunk 组动作，
         # 缩短有效决策步数 -> PPO 信用分配更容易、动作更平滑。chunk=1 就是每次一步。
         self.chunk = max(1, int(chunk))
@@ -103,7 +108,8 @@ class CombatEnv(gym.Env):
         self.rng = np.random.default_rng(seed)
 
         self.action_space = spaces.MultiDiscrete([N_MOVE, N_SHOOT] * self.chunk)
-        self.observation_space = spaces.Box(-10.0, 10.0, shape=(OBS_DIM,), dtype=np.float32)
+        self.observation_space = spaces.Box(-10.0, 10.0, shape=(self.obs_dim,),
+                                            dtype=np.float32)
 
         self.grid = None
         self.last_state = None
@@ -273,8 +279,9 @@ class CombatEnv(gym.Env):
             self._prev_phi = 0.0
 
         if "player" not in s:
-            return np.zeros(OBS_DIM, dtype=np.float32), {}
-        return build_obs(s, self.grid), {"variant": variant, "room": self._prev_room}
+            return np.zeros(self.obs_dim, dtype=np.float32), {}
+        return (build_obs(s, self.grid, self.terrain_mode),
+                {"variant": variant, "room": self._prev_room})
 
     def step(self, action):
         """一次决策输出 chunk 组动作（借鉴 ACT 的 action chunking）。
@@ -308,8 +315,8 @@ class CombatEnv(gym.Env):
                 break
 
         self.steps += 1
-        obs = (build_obs(s, self.grid) if (s and "player" in s)
-               else np.zeros(OBS_DIM, dtype=np.float32))
+        obs = (build_obs(s, self.grid, self.terrain_mode) if (s and "player" in s)
+               else np.zeros(self.obs_dim, dtype=np.float32))
 
         truncated = self.steps >= self.max_steps
         if terminated or truncated:

@@ -1,4 +1,4 @@
-﻿# Binding-of-Issac — 用强化学习打以撒
+# Binding-of-Issac — 用强化学习打以撒
 
 不截屏识图，直接把游戏内存里的状态经 Lua 模组 + socket 送到 Python，
 用 PPO 学**单房间战斗**，输出按键再注入回游戏。
@@ -23,10 +23,26 @@ reset 时用控制台命令 `restart` + `goto d.<variant>` 把玩家传送进有
 （实测会在两个已清空房间之间无限来回弹，永远遇不到敌人）。624 个可用房间由
 `room_catalog.py` 探出来。
 
-**2. 观测对房间尺寸不变。**
-位置按房间尺寸归一化；地形只看玩家周围 7×7 局部窗口；敌人/子弹用固定槽位按距离排序。
-所以 15×9 和 26×14 的房间进网络后分布一致。共 **445 维**（含玩家朝向 `fire_dir`/`head_dir`、
-无敌帧、伤害/泪速/移速，以及网格三值编码：0 走不了 / 0.5 能走但危险(火堆) / 1 安全）。
+**2. 观测：位置归一化 + 固定槽位，地形两种模式。**
+
+位置按房间尺寸归一化，敌人/子弹用固定槽位按距离排序，所以 15×9 和 15×16 的房间
+进网络后分布一致。基础部分共 **396 维**（玩家朝向 `fire_dir`/`head_dir`、无敌帧、
+伤害/泪速/移速、敌人 16×8、敌弹 48×5、房间 2、门 4×3），地形的编码有两种：
+
+| 模式 | 地形 | 总维度 | 说明 |
+|---|---|---|---|
+| `local`（默认） | 玩家周围 7×7 三值窗口 | **445** | 平移不变；但实测只覆盖房间 **20.4%**，84% 的墙/石头/坑在盲区 |
+| `full`（`--full-terrain`） | 整间房铺进 28×16 画布 × 2 通道（可走/危险） | **1292** | 全房间可见；代价是失去平移不变性 |
+
+`full` 模式把房间贴画布左上角，画布 28×16 是标准房间最大外接框
+（1×1=15×9 / 1×2=15×16 / 2×1=28×9 / 2×2=28×16），多出来的部分填 0（等价"走不了"）。
+用 `python dump_state.py --replay frames.json --full-terrain` 可以直接对比两种编码。
+
+**2b. 危险格只收静态地面危险物。**
+`cdmg > 0` 的实体标成"能走但会掉血"。必须排除：玩家本体、玩家发射的一切、所有会动的弹幕
+—— 弹幕块已经有精确位置+速度，而地形每 15 帧才刷新，把会动的东西画进地形只会得到
+过期 250ms 的噪声。（实测踩过：只排除玩家本体时，玩家自己的泪弹会被标成危险格，
+等于教 AI 躲自己的子弹。）
 
 **3. 奖励**
 
@@ -73,21 +89,27 @@ python viz_viewer.py --demo --snapshot demo_viz.png     # 存一张图慢慢看
 
 # 开着游戏（steam 启动项带 --luadebug，模组已启用，且已经进了一局）
 python dump_state.py --frames 120 --json frames.json
-python viz_viewer.py
+python viz_viewer.py --replay frames.json
+
+# 对比两种地形编码（同一个 frames.json，不用再开游戏）
+python dump_state.py --replay frames.json                 # 445 维，7×7 局部
+python dump_state.py --replay frames.json --full-terrain   # 1292 维，整间房
+python viz_viewer.py  --replay frames.json --full-terrain
 ```
 
 `dump_state.py` 输出七段：通路状态 / 玩家字段全表 / 实体明细 / 地形（含字符画、
-`coll` `ent` 直方图、危险格）/ 门与地图 / **445 维观测逐维** / 多帧取值统计
+`coll` `ent` 直方图、危险格）/ 门与地图 / **观测逐维** / 多帧取值统计
 （会点出"哪些维全程恒定 = 死输入"）。
 
-`viz_viewer.py` 一张图里六个面板：① 世界俯视图（人类视角，含 7×7 地形视野框）
-② AI 的地形视野 7×7 ③ 敌人槽位 16×8 ④ 敌弹槽位 5×48 ⑤ 状态与覆盖率 ⑥ 445 维分块强度。
+`viz_viewer.py` 一张图里六个面板：① 世界俯视图（人类视角）② AI 的地形视野
+③ 敌人槽位 16×8 ④ 敌弹槽位 5×48 ⑤ 状态与覆盖率 ⑥ 分块强度。
 
 看这两个工具能立刻发现的两个观测缺陷：
 
-- **地形只喂了玩家周围 7×7**，房间另一头的石头/坑 AI 完全不知道；
+- **地形只喂了玩家周围 7×7**（默认 `local` 模式），房间另一头的石头/坑 AI 完全不知道
+  —— 实测 84% 的非空地格在窗口外。`--full-terrain` 可消除；
 - **`grid.ent`（每格是石头/便便/坑/尖刺）收到了却没用**，观测里只剩 `coll` 二值，
-  所以"石头"和"便便"、"墙"和"实心障碍"在 AI 眼里长得一模一样。
+  所以"石头"和"便便"、"墙"和"实心障碍"在 AI 眼里长得一模一样。（待做）
 
 ## 用法
 
@@ -98,10 +120,16 @@ python test_multi.py --launch 4 --keep
 # 2) 训练（--max-enemies 4 = 课程学习，先只练 <=4 敌人的房间）
 python train_multi.py --attach --combat --chunk 1 --max-enemies 4 --steps 200000
 
+# 2b) 全房间地形（观测 445→1292，网络自动加宽到 256×256）
+python train_multi.py --attach --combat --full-terrain --steps 200000
+
 # 3) 评估与诊断
 python eval_combat.py --model models/combat_v4.zip --episodes 10
 python diag_combat.py --model models/combat_v4.zip --episodes 6
 ```
+
+注意：`--full-terrain` 训练的模型不能和 `local` 的模型互换（观测维度不同），
+`--load` 旧模型时必须带上原来的地形模式。
 
 ## 已知约束（踩过的坑，别踩第二遍）
 
