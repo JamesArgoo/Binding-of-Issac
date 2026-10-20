@@ -32,7 +32,40 @@ except Exception:
     pass
 
 import multi_instance as mi
-from isaac_env import OBS_DIM, TERRAIN_FULL, TERRAIN_LOCAL, IsaacEnv, obs_dim
+from isaac_env import (OBS_DIM, TERRAIN_FULL, TERRAIN_LOCAL, IsaacEnv, obs_dim,
+                       terrain_mode_from_dim)
+
+
+def peek_obs_dim(path):
+    """不开模型就读出它训练时的观测维度。
+
+    SB3 存的 .zip 里 `data` 是 JSON，`observation_space` 序列化成
+    {":type:": Box, "_shape": [...], ":serialized:": base64}，
+    优先读 _shape，读不到再解 base64 的 pickle。
+    用它对齐地形模式，避免"模型 1292 维、环境 445 维"这种加载后才炸的错。
+    """
+    import base64
+    import json
+    import pickle
+    import zipfile
+
+    with zipfile.ZipFile(path) as z:
+        raw = z.read("data")
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        import cloudpickle
+        data = cloudpickle.loads(raw)
+
+    sp = data["observation_space"]
+    if isinstance(sp, dict):
+        shape = sp.get("_shape")
+        if shape is None and sp.get(":serialized:"):
+            shape = pickle.loads(base64.b64decode(sp[":serialized:"])).shape
+        if shape is None:
+            raise ValueError("模型里的 observation_space 读不出形状")
+        return int(shape[0])
+    return int(sp.shape[0])
 
 
 class ParallelIsaacVecEnv(VecEnv):
@@ -258,6 +291,19 @@ def main():
         return 1
 
     terrain_mode = TERRAIN_FULL if args.full_terrain else TERRAIN_LOCAL
+
+    # 热启动：以模型自己的观测维度为准，否则 predict 时形状对不上
+    if args.load:
+        try:
+            loaded_dim = peek_obs_dim(args.load)
+            mode_from_model = terrain_mode_from_dim(loaded_dim)
+            if mode_from_model != terrain_mode:
+                print(f"⚠ {args.load} 是 {loaded_dim} 维（地形 {mode_from_model}），"
+                      f"按模型来（忽略 --full-terrain）")
+            terrain_mode = mode_from_model
+        except Exception as exc:
+            print(f"⚠ 读不出 {args.load} 的观测维度（{exc}），按命令行参数 {terrain_mode} 继续")
+
     envs = build_envs(mgr, combat=args.combat, catalog=args.catalog,
                       min_enemies=args.min_enemies,
                       max_enemies=args.max_enemies,

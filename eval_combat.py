@@ -38,8 +38,18 @@ def main():
     args = ap.parse_args()
 
     from stable_baselines3 import PPO
+    from isaac_env import TERRAIN_FULL, TERRAIN_LOCAL, obs_dim, terrain_mode_from_dim
     model = PPO.load(args.model, device="cpu")
-    print(f"模型 {args.model} 加载完成")
+    dim = int(model.observation_space.shape[0])
+    try:
+        terrain_mode = terrain_mode_from_dim(dim)
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        print(f"  这个模型（{dim} 维）是用旧版观测训的，和当前代码不兼容。"
+              f"当前是 {obs_dim(TERRAIN_LOCAL)} 维（local）/ "
+              f"{obs_dim(TERRAIN_FULL)} 维（full），请用新代码重新训练。")
+        return 1
+    print(f"模型 {args.model} 加载完成（地形模式 {terrain_mode}，观测 {dim} 维）")
 
     variants = load_variants(args.catalog)
     mgr = mi.InstanceManager(n=1)
@@ -52,7 +62,7 @@ def main():
     inst = mgr.instances[0]
     ch = mgr.bridge.channels[inst.port]
     env = CombatEnv(mi.ChannelAdapter(ch), inst.controller, variants=variants,
-                    frame_skip=2, max_steps=900)
+                    frame_skip=2, max_steps=900, terrain_mode=terrain_mode)
 
     rows = []
     t0 = time.time()

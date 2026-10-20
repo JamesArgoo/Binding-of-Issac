@@ -29,7 +29,18 @@ def main():
     args = ap.parse_args()
 
     model = PPO.load(args.model, device="cpu")
-    print(f"模型已加载: {args.model}")
+    from isaac_env import (TERRAIN_FULL, TERRAIN_LOCAL, obs_dim,
+                           terrain_mode_from_dim)
+    dim = int(model.observation_space.shape[0])
+    try:
+        terrain_mode = terrain_mode_from_dim(dim)
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        print(f"  这个模型（{dim} 维）是用旧版观测训的，和当前代码不兼容。"
+              f"当前是 {obs_dim(TERRAIN_LOCAL)} 维（local）/ "
+              f"{obs_dim(TERRAIN_FULL)} 维（full），请用新代码重新训练。")
+        return 1
+    print(f"模型已加载: {args.model}（地形模式 {terrain_mode}，观测 {dim} 维）")
 
     mgr = mi.InstanceManager(n=1)
     mgr.attach()
@@ -39,7 +50,8 @@ def main():
         return 1
     mgr.resolve_mapping()
 
-    envs = build_envs(mgr, combat=True, catalog=args.catalog)
+    envs = build_envs(mgr, combat=True, catalog=args.catalog,
+                      terrain_mode=terrain_mode)
     print(f"\n开始让模型玩（{len(envs)} 个实例，Ctrl+C 停止）")
     print("画面里以撒的动作就是这个模型的真实水平。\n")
 

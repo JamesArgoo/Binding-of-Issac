@@ -68,6 +68,20 @@ def obs_dim(terrain_mode=TERRAIN_LOCAL):
 OBS_DIM = obs_dim(TERRAIN_LOCAL)        # 445，默认模式（旧脚本继续可用）
 OBS_DIM_FULL = obs_dim(TERRAIN_FULL)    # 1292
 
+
+def terrain_mode_from_dim(dim):
+    """反查：观测维度 -> 地形模式。
+
+    加载已有模型时必须用它对齐 —— 模型是按 1292 维（full）训的话，
+    环境还用 445 维（local）就会在 predict 时形状不匹配。
+    """
+    for _m in (TERRAIN_LOCAL, TERRAIN_FULL):
+        if obs_dim(_m) == int(dim):
+            return _m
+    raise ValueError(
+        f"观测维度 {dim} 不对应任何已知地形模式"
+        f"（local={obs_dim(TERRAIN_LOCAL)}, full={obs_dim(TERRAIN_FULL)}）")
+
 # Direction 枚举: 0=左 1=上 2=右 3=下
 _DIR_XY = {0: (-1.0, 0.0), 1: (0.0, -1.0), 2: (1.0, 0.0), 3: (0.0, 1.0)}
 

@@ -50,7 +50,12 @@ D_OPT = 150.0           # 理想射击距离（像素）：太近会被撞，太
 CELL = 40.0             # 一格 40 世界单位（AIsaac 的 CELL）
 WALL_PUSH = 0.6         # 顶着墙/障碍物推的每秒惩罚（治"怼着石头走"）
 SCALE = 0.1             # 整体缩放
-FPS = 30.0              # 决策频率（frame_skip=2 对应 30Hz）
+# 每秒多少个**决策步**。默认 60/frame_skip（假设游戏跑满 60fps）：
+# 注意这和实测不符 —— 本机游戏帧率约 29.6fps，frame_skip=2 时真实只有 ~14.8 步/秒。
+# 这个值只影响"死亡时罚掉剩余时间"那项。用默认 30 时，死亡惩罚(2.0/FPS)和
+# 时间代价(2.0*frame_skip/60)恰好相等，于是"早死"和"晚死"总分一模一样(都是 -6.5)，
+# 时间那一项的设计意图（早死不该省时间成本）被抵消掉了。按实测帧率传进来才是对的。
+FPS = 30.0
 RATE_WINDOW = 45        # 命中率统计窗口（步）
 HP_FULL = 6.0           # 3 颗红心 = 6 个半心
 
@@ -92,12 +97,15 @@ class CombatEnv(gym.Env):
 
     def __init__(self, bridge, controller, variants=(12, 13, 14),
                  frame_skip=2, max_steps=None, seed=None, chunk=1,
-                 terrain_mode=TERRAIN_LOCAL):
+                 terrain_mode=TERRAIN_LOCAL, fps=None):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
         self.variants = list(variants) or [12]
         self.frame_skip = frame_skip
+        # 决策频率（步/秒）。默认假设游戏跑满 60fps；实测只有 ~30fps 时应该传 15，
+        # 否则"早死"和"晚死"的奖励会完全相等（见文件顶部 FPS 的注释）。
+        self.fps = float(fps) if fps else 60.0 / max(1, frame_skip)
         # 地形编码：local = 玩家周围 7×7（445 维）；full = 整间房 28×16×2 通道（1292 维）
         self.terrain_mode = terrain_mode
         self.obs_dim = obs_dim(terrain_mode)
@@ -122,6 +130,7 @@ class CombatEnv(gym.Env):
         self._prev_hp = HP_FULL
         self._prev_phi = 0.0
         self._started_clear = False
+        self._room_idx0 = None     # 开局房间索引：变了就说明不在战斗房里了
         self._seen_tears = set()
         self._rate_window = deque(maxlen=RATE_WINDOW)
         self._ep_dealt = 0.0
@@ -256,6 +265,9 @@ class CombatEnv(gym.Env):
         self.steps = 0
         self._prev_enemy_hp, self._prev_alive = self._scan_enemies(s)
         self._prev_clear = bool(s.get("room", {}).get("clear"))
+        # 开局的房间索引：goto 出来的战斗房恒为 -3。之后只要这个值变了，
+        # 就说明玩家已经不在开局那个房间里了（死了被重开 / 被传走）。
+        self._room_idx0 = s.get("room", {}).get("index")
         # 如果 goto 落到了一个本来就已清空的房间，不能立刻判 terminated，
         # 否则会陷入 reset→立即结束→reset 的死循环
         self._started_clear = self._prev_clear
@@ -381,24 +393,32 @@ class CombatEnv(gym.Env):
         self._prev_phi = phi
 
         # ---- 清房 ----
+        # 注意：必须确认玩家还站在开局那个战斗房间里。
+        # 死亡后模组会 AUTO_RESTART 把玩家送回**起始房间**（那个房间本来就 clear=True），
+        # 如果只看 clear 就会把"死了被重开"误判成"清房成功"，白送 +40 —— 等于奖励自杀。
         room = s.get("room", {})
         cleared = bool(room.get("clear"))
-        if cleared and not self._prev_clear and not self._started_clear:
+        room_idx = room.get("index")
+        room_left = (self._room_idx0 is not None and room_idx is not None
+                     and room_idx != self._room_idx0)
+        if cleared and not room_left and not self._prev_clear and not self._started_clear:
             r += CLEAR
             self._ep_clear += 1
 
         # ---- 死亡：固定惩罚 + 罚掉剩余时间（早死不该省下时间成本）----
-        dead = hp_now <= 0
+        # room_left 同样按死亡结算：被打死/被传走都算这一局失败。
+        dead = (hp_now <= 0) or room_left
         if dead:
-            remaining_s = max(0.0, (self.max_steps - self.steps) / FPS)
+            remaining_s = max(0.0, (self.max_steps - self.steps) / self.fps)
             r -= DEATH + COST_MISS * min(remaining_s, 30.0)
 
         # 起点就已清空时不把"clear"当终止条件，避免 reset 死循环
-        terminated = bool(dead or (cleared and not self._started_clear))
+        terminated = bool(dead or (cleared and not room_left and not self._started_clear))
 
         info = {
             "dealt": dealt, "kills": kills, "fired": fired,
             "hit_rate": rate, "clear": cleared, "dead": dead,
+            "left_room": room_left,
             "hurt": self._ep_hurt, "wall": self._ep_wall,
             "ep_dealt": self._ep_dealt, "ep_fired": self._ep_fired,
         }
