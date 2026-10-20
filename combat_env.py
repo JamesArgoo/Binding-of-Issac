@@ -248,15 +248,29 @@ class CombatEnv(gym.Env):
 
     # ---------------- Gym 接口 ----------------
     def _combat_ready(self, st):
-        """指定房间已经加载好、玩家活着、房间还没清空 —— goto 成功判据。"""
+        """指定房间已经加载好、玩家活着、房间还没清空、**而且真的还有敌人** —— goto 成功判据。
+
+        必须要求"有敌人"：goto 有时会短暂返回一个 clear=False 但实际已经清空的
+        房间状态，接受它会导致回合刚开局就被判成清房（实测出现 2~9 步、
+        输出 0 的假回合），还会让 `_started_clear` 记错。
+        """
         if not st or "player" not in st or "room" not in st:
             return False
         p = st["player"]
         if (p.get("hp", 0) or 0) + (p.get("soul_hp", 0) or 0) <= 0:
             return False
-        if st["room"].get("clear"):
+        room = st["room"]
+        if room.get("clear"):
             return False
-        return "grid" in st
+        if "grid" not in st:
+            return False
+        # 至少要有一个敌人实体（或房间自己报告还有活敌）
+        if int(room.get("enemies_alive", 0) or 0) > 0:
+            return True
+        for e in st.get("entities", []):
+            if e.get("enemy") or e.get("boss"):
+                return True
+        return False
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
