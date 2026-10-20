@@ -90,7 +90,10 @@ def show_channel(state, feed=None, has_grid=False, has_map=False):
     rows = [
         ("frame", state.get("frame", "?"), "游戏逻辑帧计数"),
         ("实测帧率", f"{feed.fps:.1f} fps" if (feed and feed.fps) else "(demo/未知)",
-         "模组每 2 帧发一次"),
+         "模组每帧发一次"),
+        ("模组耗时", f"{state.get('mod_ms', 0):.2f} ms/帧"
+         if state.get("mod_ms") is not None else "(旧版模组未上报)",
+         "build_state+JSON 编码；超过 ~8ms 就是模组在拖慢游戏"),
         ("房间类型", D.room_type_name(state.get("room", {}).get("type", -1)),
          "room.type"),
         ("房间索引", state.get("room", {}).get("index"),

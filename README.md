@@ -177,6 +177,34 @@ python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
 python inspect_policy.py
 ```
 
+## 怎么练得快（实测瓶颈与放大倍数）
+
+`time/fps` 的物理上限是 **游戏逻辑帧率 ÷ frame_skip**。项目原来的数字（单实例
+25-30 步/秒）是在游戏跑满 60fps 时测的；如果你的游戏只有 ~30fps，单实例就只有
+~15 步/秒。三个独立的乘数：
+
+| 手段 | 效果 | 怎么做 |
+|---|---|---|
+| **模组瘦身**（默认已开） | JSON 12.5KB → 6.2KB（-50%），实体 31 → 12（特效占 61%） | `python install_mod.py` |
+| **每帧都发 + frame_skip=1** | 决策频率 = 游戏帧率，单实例 15 → 30 步/秒 | 模组 `SEND_EVERY=1`（已改）+ `--frame-skip 1`（默认） |
+| **多开** | 线性，4 实例 ≈ 4x（CPU 线程数就是上限，24 线程可开 6~8） | `python test_multi.py --launch 4 --keep` 再 `--attach` |
+| **turbo**（DLL 加速时钟+跳渲染） | README 记录约 5x，需 `--launch` 而非 `--attach` | `--launch N --turbo --turbo-speed 20` |
+
+`dump_state.py` 的 ① 通路状态里现在会显示 **模组耗时 ms/帧**：超过 ~8ms（30fps 时
+帧预算 33ms 的四分之一）说明是模组在拖慢游戏，先优化模组；如果很小而帧率仍是 30，
+那就是 VSync / 电源模式 / 游戏跑在核显上的问题，去改游戏侧设置。
+
+```bash
+# 完整加速组合（4 实例 + 瘦身后的模组 + frame_skip=1）
+python install_mod.py
+python test_multi.py --launch 4 --keep
+python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
+    --load models/bc_seed2 --hit-rew 1.0 --cost-miss 0.5 --steps 400000
+```
+
+启动时会**实测游戏帧率**并自动算出决策频率（不再需要手填 `--fps`），打印类似
+`实测游戏帧率 59.8 fps ÷ frame_skip 1 → 决策 59.8 步/秒`。
+
 ## 已知约束（踩过的坑，别踩第二遍）
 
 - **必须带 `python` 前缀**：Windows 把 `.py` 关联到 `C:\Windows\py.exe`，它默认用

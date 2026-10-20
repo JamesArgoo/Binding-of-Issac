@@ -230,6 +230,30 @@ def load_variants(path, min_enemies=None, max_enemies=None):
     return variants
 
 
+def measure_game_fps(adapter, seconds=1.5):
+    """实测游戏逻辑帧率，用来推算真实的决策频率。
+
+    项目原来的 fps 默认值 60/frame_skip 假设游戏跑满 60fps；但实测不少机器
+    只有 ~30fps，这时真实决策频率是 15 而不是 30 —— 死亡惩罚和时间代价会
+    恰好互相抵消，奖励就废了。所以启动时测一下，别再让人手填。
+    """
+    s = adapter.get_state()
+    if not s or "frame" not in s:
+        return None
+    t0, f0 = time.time(), s["frame"]
+    last = s
+    while time.time() - t0 < seconds:
+        cur = adapter.get_state()
+        if cur and "frame" in cur:
+            last = cur
+        time.sleep(0.02)
+    dt = time.time() - t0
+    df = last["frame"] - f0
+    if dt <= 0 or df <= 0:
+        return None
+    return df / dt
+
+
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                min_enemies=None, max_enemies=None, chunk=1,
                terrain_mode="local", hit_rew=None, cost_miss=None, fps=None):
@@ -305,8 +329,10 @@ def main():
     ap.add_argument("--cost-miss", type=float, default=None,
                     help="命中率为 0 时每秒的时间代价，默认 2.0。调小它等于抬高命中奖励的相对权重")
     ap.add_argument("--fps", type=float, default=None,
-                    help="每秒决策步数，默认 60/frame_skip(=30)。"
-                         "游戏实际只有 ~30fps 时传 15，否则早死和晚死的奖励完全相等")
+                    help="每秒决策步数。不给就启动时实测游戏帧率再除以 frame_skip")
+    ap.add_argument("--frame-skip", type=int, default=1,
+                    help="每步等几个游戏帧（默认 1）。模组已改成每帧都发数据，"
+                         "所以 1 能让决策频率等于游戏帧率")
     ap.add_argument("--n-steps", type=int, default=1024,
                     help="PPO 每次更新收集多少步（越大 advantage 估计越稳）")
     ap.add_argument("--batch", type=int, default=256, help="PPO minibatch 大小")
@@ -359,6 +385,22 @@ def main():
 
     terrain_mode = TERRAIN_FULL if args.full_terrain else TERRAIN_LOCAL
 
+    # ---------- 实测游戏帧率 → 推出真实决策频率 ----------
+    decision_fps = args.fps
+    if decision_fps is None:
+        try:
+            ch0 = mgr.bridge.channels[mgr.instances[0].port]
+            g_fps = measure_game_fps(mi.ChannelAdapter(ch0))
+        except Exception:
+            g_fps = None
+        if g_fps:
+            decision_fps = g_fps / max(1, args.frame_skip)
+            print(f"实测游戏帧率 {g_fps:.1f} fps ÷ frame_skip {args.frame_skip}"
+                  f" → 决策 {decision_fps:.1f} 步/秒")
+        else:
+            decision_fps = 60.0 / max(1, args.frame_skip)
+            print(f"⚠ 测不出游戏帧率，按 60fps 估算 → 决策 {decision_fps:.1f} 步/秒")
+
     # 热启动：以模型自己的观测维度为准，否则 predict 时形状对不上
     if args.load:
         try:
@@ -380,9 +422,10 @@ def main():
                       min_enemies=args.min_enemies,
                       max_enemies=args.max_enemies,
                       chunk=args.chunk,
+                      frame_skip=args.frame_skip,
                       terrain_mode=terrain_mode,
                       hit_rew=args.hit_rew, cost_miss=args.cost_miss,
-                      fps=args.fps)
+                      fps=decision_fps)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
