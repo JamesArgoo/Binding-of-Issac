@@ -48,6 +48,15 @@ CANVAS_W, CANVAS_H = 28, 16        # full 模式的画布：标准房间最大�
                                    #   1×1=15×9 / 1×2=15×16 / 2×1=28×9 / 2×2=28×16
 TERRAIN_CHANNELS = 2               # full 模式：ch0 可走, ch1 危险
 
+# ---- 视线（line of fire）----
+# 从玩家所在格沿 4 个射击方向（上/右/下/左，和 SHOOT_DIRS 1..4 对齐）
+# 到第一个"挡子弹"的格子有多远（格数，归一化）。
+# 挡子弹 = 网格碰撞类 2物体/3实心/4墙；坑(1)和开着的门(5)不挡。
+# 没有这 4 个数，AI 只知道"那里走不进去"，不知道"子弹会撞上去"。
+LOS_DIM = 4
+LOS_MAX_CELLS = 15.0               # 超过这个距离就当"一路畅通"
+LOS_DIRS = ((0, -1), (1, 0), (0, 1), (-1, 0))   # 上 右 下 左
+
 TERRAIN_DIMS = {
     TERRAIN_LOCAL: GRID_WIN * GRID_WIN,                    # 49
     TERRAIN_FULL: CANVAS_W * CANVAS_H * TERRAIN_CHANNELS,  # 896
@@ -60,13 +69,13 @@ def terrain_dim(terrain_mode=TERRAIN_LOCAL):
 
 
 def obs_dim(terrain_mode=TERRAIN_LOCAL):
-    """观测总维度：玩家14 + 敌人16*8 + 子弹48*5 + 地形 + 房间2 + 门12。"""
+    """观测总维度：玩家14 + 敌人16*8 + 子弹48*5 + 地形 + 视线4 + 房间2 + 门12。"""
     return (PLAYER_DIM + MAX_ENEMIES * 8 + MAX_TEARS * 5
-            + terrain_dim(terrain_mode) + 2 + 4 * 3)
+            + terrain_dim(terrain_mode) + LOS_DIM + 2 + 4 * 3)
 
 
-OBS_DIM = obs_dim(TERRAIN_LOCAL)        # 445，默认模式（旧脚本继续可用）
-OBS_DIM_FULL = obs_dim(TERRAIN_FULL)    # 1292
+OBS_DIM = obs_dim(TERRAIN_LOCAL)        # 449
+OBS_DIM_FULL = obs_dim(TERRAIN_FULL)    # 1296
 
 
 def terrain_mode_from_dim(dim):
@@ -324,6 +333,44 @@ def _terrain_block(state, grid, terrain_mode):
     return _terrain_local(state, grid)
 
 
+def line_of_fire(state, grid):
+    """玩家沿 4 个射击方向（上/右/下/左）到第一个挡子弹格子的距离。
+
+    返回长度 4 的 list，值 0~1（格数 / LOS_MAX_CELLS）。
+    索引顺序与射击动作 1=上 2=右 3=下 4=左 一一对应，方便网络直接对照。
+
+    为什么需要：泪弹撞到石头/墙就没了，但地形块只告诉 AI"那一格走不进去"，
+    没有任何一维告诉它"往这个方向射会打在石头上"。实测对局里玩家泪弹
+    大量打在墙上，这些发数全被算成"打空"，命中率被拉低、时间代价被拉高。
+    """
+    blocked = (2, 3, 4)          # 物体 / 实心 / 墙
+    out = [LOS_MAX_CELLS] * LOS_DIM
+    if not grid:
+        return [v / LOS_MAX_CELLS for v in out]
+    p = state.get("player", {})
+    gidx = p.get("grid_idx")
+    if gidx is None:
+        return [v / LOS_MAX_CELLS for v in out]
+    w, h = grid["w"], grid["h"]
+    coll = grid.get("coll") or []
+    gx, gy = int(gidx) % w, int(gidx) // w
+    span = int(LOS_MAX_CELLS)
+    for k, (dx, dy) in enumerate(LOS_DIRS):
+        dist = LOS_MAX_CELLS
+        for step in range(1, span + 1):
+            cx, cy = gx + dx * step, gy + dy * step
+            if not (0 <= cx < w and 0 <= cy < h):
+                dist = step - 1               # 出界 = 走到房间边缘
+                break
+            i = cy * w + cx
+            c = int(coll[i]) if i < len(coll) else 4
+            if c in blocked:
+                dist = step - 1               # 停在障碍前的最后一格
+                break
+        out[k] = dist
+    return [min(v, LOS_MAX_CELLS) / LOS_MAX_CELLS for v in out]
+
+
 def build_obs(state, grid, terrain_mode=TERRAIN_LOCAL):
     """把一帧状态压成固定长度观测向量。
 
@@ -393,6 +440,8 @@ def build_obs(state, grid, terrain_mode=TERRAIN_LOCAL):
 
     # 地形：local=玩家周围 7×7（0/0.5/1），full=整间房 28×16×2 通道
     obs.extend(_terrain_block(state, grid, terrain_mode))
+    # 视线：4 个射击方向到障碍物的距离（解决"子弹打在墙上"）
+    obs.extend(line_of_fire(state, grid))
 
     # 房间
     obs.append(_clip(state["room"]["enemies_alive"] / 20.0))

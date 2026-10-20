@@ -48,32 +48,134 @@ MOVE_NAMES = ["右", "右下", "下", "左下", "左", "左上", "上", "右上"
 SHOOT_NAMES = ["不射", "上", "右", "下", "左"]
 
 D_OPT = 150.0     # 理想交战距离（和 combat_env 一致）
-D_NEAR = 100.0    # 更近就往后退
-D_FAR = 220.0     # 更远就往前压
+D_NEAR = 90.0     # 更近就往后退
+STEP = 14.0       # 每步位移估计（实测真游戏约 12 单位/步）
+PROJECTILE_TYPES = (2, 7, 8, 9)
+LOS_MAX = 15.0
+BLOCKING = (2, 3, 4)      # 网格碰撞类：物体/实心/墙 —— 挡子弹
 
 
-def rule_action(px, py, ex, ey):
-    """规则标签：射击朝最近的敌人；移动维持 D_OPT 左右的交战距离并侧移。
+def _walkable(x, y, grid):
+    w, h = grid["w"], grid["h"]
+    tw, th, ox, oy = grid["tw"], grid["th"], grid["ox"], grid["oy"]
+    gx, gy = int((x - ox) / tw), int((y - oy) / th)
+    if not (0 <= gx < w and 0 <= gy < h):
+        return False
+    cells = grid.get("cells")
+    i = gy * w + gx
+    return bool(cells[i]) if (cells and i < len(cells)) else False
 
-    返回 (move_idx, shoot_idx)。
-    """
+
+def _los(px, py, grid):
+    """从某个世界坐标点看 4 个方向（上/右/下/左）的视线长度（格）。"""
+    out = [LOS_MAX] * 4
+    if not grid:
+        return out
+    w, h = grid["w"], grid["h"]
+    tw, th, ox, oy = grid["tw"], grid["th"], grid["ox"], grid["oy"]
+    coll = grid.get("coll") or []
+    gx, gy = int((px - ox) / tw), int((py - oy) / th)
+    if not (0 <= gx < w and 0 <= gy < h):
+        return out
+    for k, (dx, dy) in enumerate(((0, -1), (1, 0), (0, 1), (-1, 0))):
+        span = LOS_MAX
+        for step in range(1, int(LOS_MAX) + 1):
+            cx, cy = gx + dx * step, gy + dy * step
+            if not (0 <= cx < w and 0 <= cy < h):
+                span = step - 1
+                break
+            i = cy * w + cx
+            c = int(coll[i]) if i < len(coll) else 4
+            if c in BLOCKING:
+                span = step - 1
+                break
+        out[k] = span
+    return out
+
+
+def _threat(bullet, x, y, margin=26.0, horizon=20.0):
+    """这颗敌方子弹会不会在接下来 ~20 帧内打到 (x,y)。"""
+    vx, vy = float(bullet.get("vx", 0) or 0), float(bullet.get("vy", 0) or 0)
+    sp2 = vx * vx + vy * vy
+    if sp2 < 0.25:
+        return False
+    rx, ry = x - bullet["x"], y - bullet["y"]
+    t = (rx * vx + ry * vy) / sp2          # 最近接近时刻
+    if t < 0 or t > horizon:
+        return False
+    cx, cy = bullet["x"] + vx * t, bullet["y"] + vy * t
+    return math.hypot(x - cx, y - cy) < margin
+
+
+def _shoot_axis(px, py, ex, ey):
+    """朝敌人该按哪个射击键（1上 2右 3下 4左）。"""
     dx, dy = ex - px, ey - py
-    d = math.hypot(dx, dy) or 1.0
-    # 射击：四方向取主轴
     if abs(dx) >= abs(dy):
-        shoot = 2 if dx > 0 else 4
-    else:
-        shoot = 3 if dy > 0 else 1
+        return 2 if dx > 0 else 4
+    return 3 if dy > 0 else 1
 
-    # 移动：远了靠近、近了后退、中间侧移（避免站着被弹幕糊）
-    ux, uy = dx / d, dy / d
-    if d > D_FAR:
-        move = _vec_to_move(ux, uy)
-    elif d < D_NEAR:
-        move = _vec_to_move(-ux, -uy)
-    else:
-        move = _vec_to_move(-uy, ux)          # 切向绕圈
-    return move, shoot
+
+def rule_action(state, grid, tear_range=220.0):
+    """规则老师：射击朝最近敌人（视线被挡就不射）；移动按 1 步预演打分。
+
+    移动打分同时考虑你提的四件事：
+      1. **对齐**：让"非射击轴"上的偏移尽量小 —— 敌人斜着时先挪到同一行/列，
+         否则泪弹只会沿着主轴飞过去打空
+      2. **距离**：留在射程内、靠近 D_OPT
+      3. **视线**：新位置的射击方向不能被石头/墙挡住
+      4. **躲弹**：新位置会不会被敌方弹幕打到（垂直躲开再回来）
+    """
+    p = state["player"]
+    px, py = p["x"], p["y"]
+    ents = state.get("entities", [])
+    enemies = [e for e in ents if e.get("enemy") or e.get("boss")]
+    if not enemies:
+        return 8, 0
+    e = min(enemies, key=lambda e: (e["x"] - px) ** 2 + (e["y"] - py) ** 2)
+    ex, ey = e["x"], e["y"]
+    bullets = [b for b in ents
+               if int(b.get("type", 0)) in PROJECTILE_TYPES
+               and int(b.get("spawner_type", 0) or 0) != 1]
+
+    # ---- 射击：始终朝最近敌人瞄准 ----
+    # 不在这里判"视线被挡就不射"：那样标签里会塞满「不射」（真实房间石头很多），
+    # BC 只会学成一个几乎不开枪的哑巴。瞄准是技能，开不开枪是决策 ——
+    # 前者用 BC 教，后者交给 PPO 用命中率奖励去学（现在观测里有视线那 4 维了）。
+    shoot = _shoot_axis(px, py, ex, ey)
+
+    # ---- 移动：9 个动作各预演一步，取最高分 ----
+    bdx, bdy = ex - px, ey - py
+    horizontal = abs(bdx) >= abs(bdy)
+    off_old = (py - ey) if horizontal else (px - ex)
+    threat_now = any(_threat(b, px, py) for b in bullets)
+
+    cands = list(enumerate(DIRS8)) + [(8, (0, 0))]
+    best_i, best_s = 8, -1e18
+    for i, (mx, my) in cands:
+        nx, ny = px + mx * STEP, py + my * STEP
+        if not _walkable(nx, ny, grid):
+            continue
+        nd = math.hypot(ex - nx, ey - ny)
+        s = 0.0
+        # 距离
+        if nd > tear_range:
+            s -= 6.0 + (nd - tear_range) / 40.0
+        s -= abs(nd - D_OPT) / 90.0
+        # 对齐（让非射击轴偏移变小）
+        off_new = (ny - ey) if horizontal else (nx - ex)
+        s -= abs(off_new) / 45.0
+        if abs(off_new) <= 14.0:
+            s += 1.5
+        # 视线：新位置的射击轴别被挡（移动时就该往能打到的位置挪）
+        los_new = _los(nx, ny, grid)
+        if los_new[shoot - 1] + 0.5 < nd / max(grid["tw"], 1e-6):
+            s -= 2.0
+        # 躲弹：只有当前确实被威胁时才躲
+        if threat_now:
+            s += 1.0 if not any(_threat(b, nx, ny) for b in bullets) else -3.0
+        if s > best_s:
+            best_s, best_i = s, i
+    return best_i, shoot
 
 
 def _vec_to_move(ux, uy):
@@ -149,8 +251,9 @@ def collect(frames, grid, terrain_mode, per_frame=120, seed=0):
             ang = rng.uniform(0, 2 * math.pi)
             r = rng.uniform(60.0, 420.0)
             ex, ey = ax + r * math.cos(ang), ay + r * math.sin(ang)
-            m, sh = rule_action(ax, ay, ex, ey)
-            X.append(build_obs(_make_state(ax, ay, ex, ey, grid), grid, terrain_mode))
+            st = _make_state(ax, ay, ex, ey, grid)
+            m, sh = rule_action(st, grid)
+            X.append(build_obs(st, grid, terrain_mode))
             Ym.append(m)
             Ys.append(sh)
     return (np.asarray(X, dtype=np.float32),
@@ -167,8 +270,8 @@ def main():
     ap.add_argument("--steps-per-anchor", type=int, default=120,
                     help="每个玩家位置生成多少个敌人方位样本")
     ap.add_argument("--epochs", type=int, default=15)
-    ap.add_argument("--head", default="shoot", choices=["shoot", "both"],
-                    help="shoot=只教瞄准（移动留给 PPO）；both=移动也一起教")
+    ap.add_argument("--head", default="both", choices=["shoot", "both"],
+                    help="both=瞄准和移动都教（默认）；shoot=只教瞄准，移动留给 PPO")
     ap.add_argument("--terrain", default=None, choices=[TERRAIN_LOCAL, TERRAIN_FULL],
                     help="地形模式；默认按 --frames 的模型推断，没有就用 full")
     ap.add_argument("--load", default=None,
@@ -251,8 +354,8 @@ def main():
             line += f"  移动交叉熵 {tot_m / N:.4f}"
         print(line)
 
-    # ---- 自检：四方向归因 ----
-    print("\n自检（把敌人放在玩家四个方向，看射击跟不跟）：")
+    # ---- 自检 ----
+    print("\n自检 1（把敌人放在玩家四个方向，看射击跟不跟）：")
     off = {"上": (0, -1), "右": (1, 0), "下": (0, 1), "左": (-1, 0)}
     want = {"上": 1, "右": 2, "下": 3, "左": 4}
     ax, ay = grid["ox"] + grid["w"] * grid["tw"] / 2, grid["oy"] + grid["h"] * grid["th"] / 2
@@ -269,7 +372,41 @@ def main():
         hit += ok
         print(f"  敌人在{name:<2} -> 射击={am:<3} {'✓' if ok else '✗'}   "
               + " ".join(f"{SHOOT_NAMES[i]}{p[i]:.0%}" for i in range(5)))
-    print(f"四方向命中 {hit}/4" + ("  ✅" if hit == 4 else "  ⚠ 规则/地形可能有问题"))
+    print(f"  四方向命中 {hit}/4" + ("  ✅" if hit == 4 else "  ⚠"))
+
+    print("\n自检 2（敌人斜着放，看移动会不会往同一行/列上靠）：")
+    for label, (dx, dy) in {"敌人在右下 300,80": (300, 80),
+                            "敌人在左上 -300,-80": (-300, -80),
+                            "敌人在右上 250,-70": (250, -70),
+                            "敌人在左下 -250,70": (-250, 70)}.items():
+        ex, ey = ax + dx, ay + dy
+        st = _make_state(ax, ay, ex, ey, grid)
+        o = build_obs(st, grid, terrain_mode)
+        a, _ = model.predict(o, deterministic=True)
+        mi = int(a[0])
+        mx, my = DIRS8[mi] if mi < 8 else (0, 0)
+        # 主轴 = 偏移大的那个轴；对齐 = 消掉另一轴上的偏移
+        horizontal = abs(dx) >= abs(dy)
+        off0 = (0 - dy) if horizontal else (0 - dx)
+        off1 = (my * STEP - dy) if horizontal else (mx * STEP - dx)
+        better = abs(off1) < abs(off0)
+        print(f"  {label:<20} -> 移动={MOVE_NAMES[mi]:<3} "
+              f"非主轴偏移 {off0:+.0f} -> {off1:+.0f} "
+              f"{'✓ 往对齐方向挪' if better else '✗ 没往对齐方向'}"
+              f"   射击={SHOOT_NAMES[int(a[1])]}")
+
+    print("\n自检 3（视线观测有没有正常工作 —— 挡子弹的是 2物体/3实心/4墙）：")
+    w, h = grid["w"], grid["h"]
+    tw, th, ox, oy = grid["tw"], grid["th"], grid["ox"], grid["oy"]
+    px, py = ox + 3.5 * tw, oy + (h - 3) * th     # 房间左侧、靠下（左边就是墙）
+    los = _los(px, py, grid)
+    st = _make_state(px, py, px - 300, py, grid)
+    o = build_obs(st, grid, terrain_mode)
+    l0, l1 = D.block_slices(terrain_mode)["los"]
+    print(f"  玩家格=({int((px - ox) / tw)},{int((py - oy) / th)})  "
+          f"视线 上{los[0]:.0f} 右{los[1]:.0f} 下{los[2]:.0f} 左{los[3]:.0f} 格")
+    print(f"  观测里的视线块 = {np.round(o[l0:l1], 2)}（左=0 说明左边紧贴墙）")
+    print("  BC 不教「该不该开枪」，这部分交给 PPO：打空会拉低命中率 -> 时间代价变贵")
 
     out = args.out
     model.save(out)

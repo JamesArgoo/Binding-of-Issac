@@ -358,6 +358,11 @@ def main():
     # 热启动：以模型自己的观测维度为准，否则 predict 时形状对不上
     if args.load:
         try:
+            args.load = resolve_model_path(args.load)     # 允许省略 .zip / 用 latest
+        except FileNotFoundError as exc:
+            print(exc)
+            return 1
+        try:
             loaded_dim = peek_obs_dim(args.load)
             mode_from_model = terrain_mode_from_dim(loaded_dim)
             if mode_from_model != terrain_mode:

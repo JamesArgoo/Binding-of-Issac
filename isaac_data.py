@@ -22,9 +22,10 @@ import numpy as np
 
 # 观测的真正定义在这里；本模块只做标注
 try:
-    from isaac_env import (CANVAS_H, CANVAS_W, GRID_WIN, MAX_ENEMIES, MAX_TEARS,
-                           OBS_DIM, OBS_DIM_FULL, PLAYER_DIM, TERRAIN_CHANNELS,
-                           TERRAIN_FULL, TERRAIN_LOCAL, _hazard_cells, build_obs,
+    from isaac_env import (CANVAS_H, CANVAS_W, GRID_WIN, LOS_DIM, LOS_MAX_CELLS,
+                           MAX_ENEMIES, MAX_TEARS, OBS_DIM, OBS_DIM_FULL,
+                           PLAYER_DIM, TERRAIN_CHANNELS, TERRAIN_FULL,
+                           TERRAIN_LOCAL, _hazard_cells, build_obs, line_of_fire,
                            normalize_grid, obs_dim, terrain_dim)
 except ImportError as _exc:                       # pragma: no cover - 环境问题
     _prefix = os.environ.get("CONDA_PREFIX")
@@ -147,6 +148,7 @@ def obs_groups(terrain_mode=TERRAIN_LOCAL):
         ("enemy", "敌人", MAX_ENEMIES * 8, "#E45756"),
         ("tear", "敌弹", MAX_TEARS * 5, "#F58518"),
         ("grid", "地形", terrain_dim(terrain_mode), "#54A24B"),
+        ("los", "视线", LOS_DIM, "#E8A33D"),
         ("room", "房间", 2, "#B279A2"),
         ("door", "门", 12, "#72B7B2"),
     ]
@@ -191,6 +193,7 @@ def obs_labels(terrain_mode=TERRAIN_LOCAL):
             for dx in range(-(GRID_WIN // 2), GRID_WIN // 2 + 1):
                 lab.append(("grid", f"格{dx:+d},{dy:+d}"))
 
+    lab += [("los", f"视线·{n}") for n in ("上", "右", "下", "左")]
     lab += [("room", "敌人数量"), ("room", "已清空")]
     for s in range(4):
         lab += [("door", f"门{s}·x"), ("door", f"门{s}·y"), ("door", f"门{s}·开")]
@@ -208,13 +211,15 @@ def block_slices(terrain_mode=TERRAIN_LOCAL):
     """各块在观测向量里的切片（顺序同 build_obs）。"""
     t0 = PLAYER_DIM + MAX_ENEMIES * 8 + MAX_TEARS * 5
     t1 = t0 + terrain_dim(terrain_mode)
+    l1 = t1 + LOS_DIM
     return {
         "player": (0, PLAYER_DIM),
         "enemy": (PLAYER_DIM, PLAYER_DIM + MAX_ENEMIES * 8),
         "tear": (PLAYER_DIM + MAX_ENEMIES * 8, t0),
         "grid": (t0, t1),
-        "room": (t1, t1 + 2),
-        "door": (t1 + 2, obs_dim(terrain_mode)),
+        "los": (t1, l1),
+        "room": (l1, l1 + 2),
+        "door": (l1 + 2, obs_dim(terrain_mode)),
     }
 
 
@@ -232,6 +237,7 @@ def obs_blocks(obs, terrain_mode=TERRAIN_LOCAL):
     obs = np.asarray(obs, dtype=np.float32).ravel()
     sl = block_slices(terrain_mode)
     g0, g1 = sl["grid"]
+    l0, l1 = sl["los"]
     d0, d1 = sl["door"]
     grid = (obs[g0:g1].reshape(TERRAIN_CHANNELS, CANVAS_H, CANVAS_W)
             if terrain_mode == TERRAIN_FULL
@@ -241,6 +247,7 @@ def obs_blocks(obs, terrain_mode=TERRAIN_LOCAL):
         "enemy": obs[sl["enemy"][0]:sl["enemy"][1]].reshape(MAX_ENEMIES, 8),
         "tear": obs[sl["tear"][0]:sl["tear"][1]].reshape(MAX_TEARS, 5).T,
         "grid": grid,
+        "los": obs[l0:l1],
         "room": obs[slice(*sl["room"])],
         "door": obs[d0:d1].reshape(4, 3),
     }
