@@ -72,6 +72,7 @@ death  -5 - 2.0*min(剩余秒数, 30)                    # 早死不该省时间
 | `viz_viewer.py` | **可视化**：人类看到的房间 vs 网络收到的观测，并排对照 |
 | `inspect_policy.py` | **离线查策略**：不开游戏，看模型的动作分布/熵/价值，并做"敌人换方向动作跟不跟"的归因实验 |
 | `selftest_learn.py` | **可学性自检**：用同一套观测造可控假环境，验证 PPO 到底能不能学会"朝敌人射" |
+| `bc_pretrain.py` | **BC 热启动**：用规则给策略头灌"瞄准"能力（PPO 从零探索不出来，见下） |
 | `isaac_bridge.py` | 状态解析小工具（敌人/敌方子弹/Pickup） |
 | `isaac_env.py` | 观测构建 `build_obs`、网格可走性归一化、危险格 |
 | `combat_env.py` | 单房间战斗环境（奖励 + reset + chunk） |
@@ -151,6 +152,29 @@ python selftest_learn.py --sweep           # 扫奖励强度，找"学得动"的
 ```bash
 python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
     --hit-rew 1.0 --cost-miss 0.5 --fps 15 --steps 200000
+```
+
+## 关键：瞄准必须用 BC 热启动，PPO 从零探索不出来
+
+归因实验（`inspect_policy.py`）在多个模型上一致地显示：敌人放在玩家上/右/下/左，
+**射击概率几乎完全一样**（差 <1%）。PPO 训 45k / 300k / 355k 步都一样，
+可控假环境里即使给 +0.5/步的密集瞄准奖励、跑 30k 步，也只学会"一直射同一个方向"。
+
+而用**同一套观测、同一个网络**做监督学习，15 个 epoch 就四方向 4/4、每方向 100% 正确。
+
+原因：PPO 自己的移动策略会把敌人方位压到很窄的分布里，而射中又是稀疏奖励，
+梯度分不出"哪个方向更好"。瞄准是"一学就会、但随机探索碰不到"的子技能。
+
+```bash
+# 1) 生成 BC 种子（几秒钟，不用开游戏；有真实帧更好）
+python bc_pretrain.py --frames frames.json --out models/bc_seed
+
+# 2) 从这个种子接着 PPO 微调（移动策略仍由 PPO 学）
+python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
+    --load models/bc_seed --hit-rew 1.0 --cost-miss 0.5 --fps 15 --steps 200000
+
+# 3) 随时检查：归因应该是 4/4，且熵要往下走
+python inspect_policy.py
 ```
 
 ## 已知约束（踩过的坑，别踩第二遍）
