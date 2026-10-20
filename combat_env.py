@@ -44,7 +44,13 @@ COST_HIT = 0.5          # 命中率=1 时每秒的时间代价
 COST_MISS = 2.0         # 命中率=0 时每秒的时间代价
 CLEAR = 40.0            # 清房（AIsaac ROOM_POINTS['normal']=40）
 DEATH = 5.0             # 死亡固定惩罚
-ALIGN = 0.2             # 对齐势权重（AIsaac HRW align=0.2）
+ALIGN = 0.2             # 距离势权重（AIsaac HRW align=0.2）：鼓励站在刚好打得到的距离
+ALIGN_OFF = 1.0         # **对齐势**权重：奖励"把自己的行/列挪到和敌人一致"
+                        # 以撒的泪弹只有 4 个方向，敌人斜着时无论怎么按都打不中，
+                        # 必须先把"非射击轴"上的偏移消掉。原来的奖励里只有距离势
+                        # (每步 ±0.02 缩放分)，对齐完全没被激励 —— 这是"打不准"的
+                        # 头号原因。1.0 时：挪 1 格(40 单位)对齐 ≈ +0.1 缩放分，
+                        # 而掉 1 点血 = -1.0，量级终于能比了。
 GAMMA = 0.99            # 势函数折扣，必须和 PPO 的 gamma 一致
 D_OPT = 150.0           # 理想射击距离（像素）：太近会被撞，太远打不着
 CELL = 40.0             # 一格 40 世界单位（AIsaac 的 CELL）
@@ -98,8 +104,7 @@ class CombatEnv(gym.Env):
     def __init__(self, bridge, controller, variants=(12, 13, 14),
                  frame_skip=2, max_steps=None, seed=None, chunk=1,
                  terrain_mode=TERRAIN_LOCAL, fps=None,
-                 hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart",
-                 hurt_scale=1.0, fail_on_hurt=False, min_hp=3.0):
+                 hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart",                 hurt_scale=1.0, fail_on_hurt=False, min_hp=3.0, align_off=ALIGN_OFF):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
@@ -127,6 +132,8 @@ class CombatEnv(gym.Env):
         self.fail_on_hurt = bool(fail_on_hurt)
         # auto 模式的补血阈值：血量低于这个值就整局重开
         self.min_hp = float(min_hp)
+        # 对齐势权重：奖励"把非射击轴上的偏移消掉"（泪弹只有 4 方向，不对齐打不中）
+        self.align_off = float(align_off)
         self.last_reset_s = 0.0     # 上一次 reset 花了多少秒（诊断）
         self.last_ep_steps = 0      # 上一回合走了多少步（诊断）
         self._reset_fallbacks = 0   # goto 连试 4 次都没进战斗房的次数（诊断）
@@ -158,6 +165,8 @@ class CombatEnv(gym.Env):
         self._prev_room = None
         self._prev_hp = HP_FULL
         self._prev_phi = 0.0
+        self._prev_phi_off = 0.0
+
         self._started_clear = False
         self._room_idx0 = None     # 开局房间索引：变了就说明不在战斗房里了
         self._seen_tears = set()
@@ -371,15 +380,23 @@ class CombatEnv(gym.Env):
         self._ep_hurt = 0.0
         self._ep_wall = 0
 
-        # 血量与对齐势的初值（势函数必须从当前状态起算，否则第一步会凭空多出一笔奖励）
+        # 血量与两个势函数的初值（势函数必须从当前状态起算，否则第一步会凭空多出一笔奖励）
         pp = s.get("player", {}) if s else {}
         self._prev_hp = float(pp.get("hp", 0) or 0) + float(pp.get("soul_hp", 0) or 0)
         enemies0 = get_enemies(s) if (s and "player" in s) else []
         if enemies0:
-            d0 = min(math.hypot(e["x"] - pp["x"], e["y"] - pp["y"]) for e in enemies0)
+            near0 = min(enemies0,
+                        key=lambda e: (e["x"] - pp["x"]) ** 2 + (e["y"] - pp["y"]) ** 2)
+            d0 = math.hypot(near0["x"] - pp["x"], near0["y"] - pp["y"])
             self._prev_phi = -ALIGN * abs(d0 - D_OPT) / CELL
+            dx0 = near0["x"] - pp["x"]
+            dy0 = near0["y"] - pp["y"]
+            off0 = abs(dy0) if abs(dx0) >= abs(dy0) else abs(dx0)
+            self._prev_phi_off = -self.align_off * off0 / CELL
         else:
             self._prev_phi = 0.0
+            self._prev_phi_off = 0.0
+
 
         if "player" not in s:
             self.last_reset_s = time.time() - t_reset
@@ -482,14 +499,27 @@ class CombatEnv(gym.Env):
         # ---- 对齐势（potential-based，不改变结果排序）----
         #     Φ = -ALIGN * |d - D_OPT| / CELL：鼓励停在"刚好能打到敌人"的距离，
         #     太近会被撞、太远打不着。势函数形式保证不会扭曲最终收益排序。
+        #
+        #     另外再加一个**对齐势** Φ_off：泪弹只有 4 个方向，敌人斜着时
+        #     必须先消掉"非射击轴"上的偏移才能打中。只给距离势的话，
+        #     策略会学会"保持距离边走边射"，但永远学不会"先对齐再开枪"，
+        #     表现出来就是"打不准、一直擦边"。
         enemies_all = get_enemies(s)
         if enemies_all:
-            d = min(math.hypot(e["x"] - p["x"], e["y"] - p["y"]) for e in enemies_all)
+            near = min(enemies_all,
+                       key=lambda e: (e["x"] - p["x"]) ** 2 + (e["y"] - p["y"]) ** 2)
+            d = math.hypot(near["x"] - p["x"], near["y"] - p["y"])
             phi = -ALIGN * abs(d - D_OPT) / CELL
+            # 主轴 = 偏移大的那个轴（泪弹就往那个方向射），另一轴就是"对齐误差"
+            dx, dy = near["x"] - p["x"], near["y"] - p["y"]
+            off = abs(dy) if abs(dx) >= abs(dy) else abs(dx)
+            phi_off = -self.align_off * off / CELL
         else:
-            phi = 0.0
+            phi, phi_off = 0.0, 0.0
         r += GAMMA * phi - self._prev_phi
+        r += GAMMA * phi_off - self._prev_phi_off
         self._prev_phi = phi
+        self._prev_phi_off = phi_off
 
         # ---- 清房 ----
         # 注意：必须确认玩家还站在开局那个战斗房间里。

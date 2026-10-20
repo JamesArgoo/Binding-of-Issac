@@ -393,7 +393,7 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                enemy_types=None, exclude_enemy_types=None,
                terrain_mode="local", hit_rew=None, cost_miss=None, fps=None,
                reset_mode="restart", hurt_scale=None, fail_on_hurt=False,
-               min_hp=3.0):
+               min_hp=3.0, align_off=None):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -415,6 +415,8 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         kw["hurt_scale"] = hurt_scale
     kw["fail_on_hurt"] = bool(fail_on_hurt)
     kw["min_hp"] = float(min_hp)
+    if align_off is not None:
+        kw["align_off"] = float(align_off)
     # fail_on_hurt + keep 不相容：keep 不重开，血量会一路往下掉，
     # 于是"掉血即结束"的回合越跑越短、最后卡在濒死状态。
     # auto 没这个问题（血量低于 min_hp 就会重开补满），所以只有 keep 需要拦。
@@ -482,6 +484,10 @@ def main():
                          "auto=血量 >= --min-hp 就 goto、太低才重开（推荐）")
     ap.add_argument("--min-hp", type=float, default=3.0,
                     help="auto 模式的补血阈值：血量低于它才整局重开（默认 3）")
+    ap.add_argument("--align-off", type=float, default=None,
+                    help="对齐势权重（默认 1.0）：奖励把非射击轴偏移消掉。"
+                         "泪弹只有 4 方向，不对齐就打不中；原来这一项完全没有，"
+                         "是「打不准」的头号原因")
     ap.add_argument("--hurt-scale", type=float, default=None,
                     help="受伤惩罚倍率（默认 1.0）。--hit-rew 调到 1.0 后，一个回合"
                          "打出的伤害约 28 分、掉光血只扣 12 分，于是贴脸换血最优；"
@@ -601,7 +607,8 @@ def main():
                       terrain_mode=terrain_mode,
                       hit_rew=args.hit_rew, cost_miss=args.cost_miss,
                       fps=decision_fps, reset_mode=args.reset_mode,
-                      hurt_scale=args.hurt_scale, fail_on_hurt=args.fail_on_hurt)
+                      hurt_scale=args.hurt_scale, fail_on_hurt=args.fail_on_hurt,
+                      align_off=args.align_off)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
