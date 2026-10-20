@@ -130,6 +130,8 @@ class CombatEnv(gym.Env):
         self.last_reset_s = 0.0     # 上一次 reset 花了多少秒（诊断）
         self.last_ep_steps = 0      # 上一回合走了多少步（诊断）
         self._reset_fallbacks = 0   # goto 连试 4 次都没进战斗房的次数（诊断）
+        # 本次对局已经进过的房间 variant：避免重进已被清空的房间白拿清房奖励
+        self._used_variants = set()
         # 决策频率（步/秒）。默认假设游戏跑满 60fps；实测只有 ~30fps 时应该传 15，
         # 否则"早死"和"晚死"的奖励会完全相等（见文件顶部 FPS 的注释）。
         self.fps = float(fps) if fps else 60.0 / max(1, frame_skip)
@@ -301,11 +303,30 @@ class CombatEnv(gym.Env):
         # 2) 传送进一个有敌人的房间。
         #    原来这里用固定 time.sleep(0.8) 盲等，改成轮询到"真的进了战斗房间"为止：
         #    顺利时 0.1~0.3 秒就返回，失败才退到超时。
+        #
+        #    **必须避开本次对局已经进过的房间**：goto d.<variant> 重进同一间房时，
+        #    那间房如果已经被清空过，进去就是 clear=True —— 等于白送一个 +40 清房奖励。
+        #    实测演示里 13% 的回合是这种"6 步、零输出、零受伤"的白捡。
+        #    进满一轮房间就整局重开一次（35 个房间只要重开 1 次，成本可忽略）。
         variant = None
         s = None
         ready = False
-        for _ in range(4):
-            variant = int(self.rng.choice(self.variants))
+        pool = [v for v in self.variants if v not in self._used_variants]
+        if not pool:
+            if self.reset_mode != "restart":
+                self._cmd("restart")
+                self._wait(lambda st: self._alive(st), timeout=15.0)
+            self._used_variants.clear()
+            pool = list(self.variants)
+        for attempt in range(4):
+            if not pool:
+                break
+            variant = int(self.rng.choice(pool))
+            self._used_variants.add(variant)
+            try:
+                pool.remove(variant)
+            except ValueError:
+                pass
             self._cmd(f"goto d.{variant}")
             time.sleep(0.2)                       # 让房间转场先开始
             s = self._wait(self._combat_ready, timeout=4.0, poll=0.02)
