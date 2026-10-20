@@ -43,3 +43,7 @@ turbo/*.log
 turbo/*.png
 turbo_targets.json
 models/*.zip
+
+# 提交消息临时文件
+.commit_msg.txt
+.cm.txt
