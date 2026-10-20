@@ -240,22 +240,25 @@ class ProgressCallback(BaseCallback):
     n_steps × n_envs 步，在真实游戏环境里（每秒几十步）要几十秒才出一行，
     看起来就像训练卡死了 —— 实测 4 实例时一次迭代约 34 秒。
 
-    这个回调把「已经跑了多少步、现在多少步/秒、完成了几个回合、最近回报」
-    每 10 秒打出来，慢速实时环境也能看到进度。
+    这里同时打印「本段速率」（最近一个窗口）和「平均速率」（全程），
+    以及 reset 耗时 / 回合长度 —— 因为 ETA 会跳，根源就是回合结束时
+    要传送进新房间，那段时间不产生任何步数。
     """
 
     def __init__(self, every=10.0):
         super().__init__()
         self.every = float(every)
         self.t0 = None
-        self.last = None
+        self.last_t = None
+        self.last_steps = 0
         self.episodes = 0
         self.ep_rews = []
 
     def _on_step(self):
         now = time.time()
         if self.t0 is None:
-            self.t0 = self.last = now
+            self.t0 = self.last_t = now
+            self.last_steps = self.num_timesteps
             print("  （每个 PPO 迭代结束会打一张日志表；下面是滚动进度）")
             return True
         for info in (self.locals.get("infos") or []):
@@ -264,19 +267,40 @@ class ProgressCallback(BaseCallback):
                 self.episodes += 1
                 self.ep_rews.append(float(ep.get("r", 0.0)))
                 self.ep_rews = self.ep_rews[-30:]
-        if now - self.last >= self.every:
-            dt = now - self.t0
-            rate = self.num_timesteps / max(dt, 1e-9)
-            done = self.num_timesteps
-            total = getattr(self.model, "_total_timesteps", None)
-            eta = ""
-            if total and rate > 0:
-                eta = f"  剩余约 {(total - done) / rate / 60:.1f} 分钟"
-            recent = (f"  最近回合回报 {sum(self.ep_rews) / len(self.ep_rews):+.2f}"
-                      if self.ep_rews else "")
-            print(f"  [{dt:6.0f}s] {done:>7} 步  {rate:6.1f} 步/秒  "
-                  f"完成 {self.episodes} 回合{recent}{eta}")
-            self.last = now
+
+        if now - self.last_t < self.every:
+            return True
+
+        dt_win = max(now - self.last_t, 1e-9)
+        dt_all = max(now - self.t0, 1e-9)
+        steps = self.num_timesteps
+        rate_win = (steps - self.last_steps) / dt_win
+        rate_avg = steps / dt_all
+        self.last_t, self.last_steps = now, steps
+
+        total = getattr(self.model, "_total_timesteps", None) or 0
+        eta = ""
+        if total and rate_avg > 0:
+            eta = f"  剩余约 {(total - steps) / rate_avg / 60:.1f} 分钟"
+        recent = (f"  最近回合回报 {sum(self.ep_rews) / len(self.ep_rews):+.2f}"
+                  if self.ep_rews else "")
+
+        # reset 耗时 / 回合长度（判断时间到底花在哪）
+        extra = ""
+        try:
+            rs = [x for x in self.training_env.get_attr("last_reset_s") or []
+                  if isinstance(x, (int, float))]
+            ep_len = [x for x in self.training_env.get_attr("last_ep_steps") or []
+                      if isinstance(x, (int, float))]
+            if rs and sum(rs) > 0:
+                extra = (f"  reset {sum(rs) / len(rs):.1f}s"
+                         f" / 回合 {sum(ep_len) / max(1, len(ep_len)):.0f} 步")
+        except Exception:
+            pass
+
+        print(f"  [{dt_all:6.0f}s] {steps:>7} 步  "
+              f"本段 {rate_win:5.1f} / 平均 {rate_avg:5.1f} 步/秒  "
+              f"完成 {self.episodes} 回合{recent}{extra}{eta}")
         return True
 
 
@@ -306,7 +330,8 @@ def measure_game_fps(adapter, seconds=1.5):
 
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                min_enemies=None, max_enemies=None, chunk=1,
-               terrain_mode="local", hit_rew=None, cost_miss=None, fps=None):
+               terrain_mode="local", hit_rew=None, cost_miss=None, fps=None,
+               reset_mode="restart"):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -324,6 +349,7 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         kw["cost_miss"] = cost_miss
     if fps is not None:
         kw["fps"] = fps
+    kw["reset_mode"] = reset_mode
 
     if combat:
         from combat_env import CombatEnv
@@ -370,6 +396,12 @@ def main():
                     help="课程学习：只练敌人数量 <= N 的房间（先易后难）")
     ap.add_argument("--chunk", type=int, default=1,
                     help="action chunking：一次决策输出连续 N 组动作（借鉴 ACT，建议 2~4）")
+    ap.add_argument("--reset-mode", default="restart",
+                    choices=["restart", "keep"],
+                    help="restart=每回合整局重开（照 AIsaac，保证满血）；"
+                         "keep=玩家活着就只 goto 下一间房，不重开。"
+                         "实测回合只有 ~180 步（6 秒）而重开要 2-4 秒，"
+                         "keep 能省掉 30-40% 的训练时间")
     ap.add_argument("--save-every", type=int, default=25000,
                     help="每训练多少总步数存一个 checkpoint（默认 25000）。"
                          "多开 + 高帧率下吞吐能到几百步/秒，按步数存会一秒一个、"
@@ -479,7 +511,7 @@ def main():
                       frame_skip=args.frame_skip,
                       terrain_mode=terrain_mode,
                       hit_rew=args.hit_rew, cost_miss=args.cost_miss,
-                      fps=decision_fps)
+                      fps=decision_fps, reset_mode=args.reset_mode)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")

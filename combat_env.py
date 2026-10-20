@@ -98,7 +98,7 @@ class CombatEnv(gym.Env):
     def __init__(self, bridge, controller, variants=(12, 13, 14),
                  frame_skip=2, max_steps=None, seed=None, chunk=1,
                  terrain_mode=TERRAIN_LOCAL, fps=None,
-                 hit_rew=HIT_REW, cost_miss=COST_MISS):
+                 hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart"):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
@@ -110,6 +110,14 @@ class CombatEnv(gym.Env):
         # -> 每步约 0.005，正好落在这个学不动的区间里。所以这两个值要一起调。
         self.hit_rew = float(hit_rew)
         self.cost_miss = float(cost_miss)
+        # reset 策略：
+        #   "restart"（默认，照 AIsaac）每回合整局重开，保证满血、楼层一致。
+        #   "keep"   玩家还活着就只 goto 下一间房，不重开 —— 重开要好几次秒，
+        #            而实测回合本身只有 ~180 步（6 秒），重开能吃掉 30-40% 的训练时间。
+        #            代价：血量会跨回合累积（死了模组照样会自动重开，等于回满血）。
+        self.reset_mode = reset_mode
+        self.last_reset_s = 0.0     # 上一次 reset 花了多少秒（诊断）
+        self.last_ep_steps = 0      # 上一回合走了多少步（诊断）
         # 决策频率（步/秒）。默认假设游戏跑满 60fps；实测只有 ~30fps 时应该传 15，
         # 否则"早死"和"晚死"的奖励会完全相等（见文件顶部 FPS 的注释）。
         self.fps = float(fps) if fps else 60.0 / max(1, frame_skip)
@@ -227,38 +235,44 @@ class CombatEnv(gym.Env):
         return min(1.0, hits / fired)
 
     # ---------------- Gym 接口 ----------------
+    def _combat_ready(self, st):
+        """指定房间已经加载好、玩家活着、房间还没清空 —— goto 成功判据。"""
+        if not st or "player" not in st or "room" not in st:
+            return False
+        p = st["player"]
+        if (p.get("hp", 0) or 0) + (p.get("soul_hp", 0) or 0) <= 0:
+            return False
+        if st["room"].get("clear"):
+            return False
+        return "grid" in st
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        t_reset = time.time()
         self.kc.release_all()
 
-        # 1) 重开一局：每回合都重开，保证满血、楼层一致
-        #    注意死亡结算画面要好几秒才结束，restart 在期间不生效，所以超时给长一点
-        if not self._alive(self._state()):
-            for _ in range(2):
-                self._cmd("restart")
-                if self._wait(lambda st: self._alive(st), timeout=12.0):
-                    break
-        self._cmd("restart")
-        self._wait(lambda st: self._alive(st), timeout=15.0)
-        # 关键：重开的房间转场会持续一会儿，紧接着发的 goto 会被吞掉 ——
-        # 实测 reset 后玩家还留在起始房间。这里先等转场结束。
-        time.sleep(0.9)
+        # 1) 需要整局重开吗？
+        #    reset_mode="restart"（默认，照 AIsaac）：每回合都重开，保证满血、楼层一致。
+        #    reset_mode="keep"   ：只要玩家还活着就不重开，直接 goto 下一间房 ——
+        #      重开一次要好几秒，而实测回合本身只有 ~180 步（6 秒），
+        #      所以重开能占掉 30~40% 的训练时间。
+        s = self._state()
+        if self.reset_mode != "keep" or not self._alive(s):
+            self._cmd("restart")
+            self._wait(lambda st: self._alive(st), timeout=15.0)
 
-        # 2) 传送进一个有敌人的房间
-        #    goto 造出来的房间 room.index 恒为 -3（不在楼层地图上），
-        #    所以用"房间是否已清空"判断有没有真的进到战斗房间，不行就重发。
-        variant = int(self.rng.choice(self.variants))
-        s = None
-        for _ in range(5):
+        # 2) 传送进一个有敌人的房间。
+        #    原来这里用固定 time.sleep(0.8) 盲等，改成轮询到"真的进了战斗房间"为止：
+        #    顺利时 0.1~0.3 秒就返回，失败才退到超时。
+        variant = None
+        for _ in range(4):
+            variant = int(self.rng.choice(self.variants))
             self._cmd(f"goto d.{variant}")
-            time.sleep(0.8)
-            s = self._state()
-            if s and "room" in s and not s["room"]["clear"]:
+            time.sleep(0.2)                       # 让房间转场先开始
+            if self._wait(self._combat_ready, timeout=4.0, poll=0.02) is not None:
                 break
-        # 等 grid 到位（地形每 15 帧刷新一次）
-        s2 = self._wait(lambda st: self._alive(st) and "grid" in st, timeout=6.0)
-        if s2 is not None:
-            s = s2
+        s = self._wait(lambda st: self._combat_ready(st) or self._alive(st),
+                       timeout=6.0, poll=0.02)
 
         # 3) 兜底
         if s is None:
@@ -268,6 +282,7 @@ class CombatEnv(gym.Env):
                  "entities": []}
 
         # 4) 初始化统计
+        ep_steps = self.steps            # 上一回合走了多少步（诊断用）
         self.last_state = s
         self.steps = 0
         self._prev_enemy_hp, self._prev_alive = self._scan_enemies(s)
@@ -298,7 +313,12 @@ class CombatEnv(gym.Env):
             self._prev_phi = 0.0
 
         if "player" not in s:
+            self.last_reset_s = time.time() - t_reset
+            self.last_ep_steps = ep_steps
             return np.zeros(self.obs_dim, dtype=np.float32), {}
+        # 记下本回合还没进对局时的重置耗时，供训练时打印（判断时间花在哪）
+        self.last_reset_s = time.time() - t_reset
+        self.last_ep_steps = ep_steps
         return (build_obs(s, self.grid, self.terrain_mode),
                 {"variant": variant, "room": self._prev_room})
 
