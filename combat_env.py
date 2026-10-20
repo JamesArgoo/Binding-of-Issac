@@ -414,9 +414,20 @@ class CombatEnv(gym.Env):
 
         # ---- 死亡：固定惩罚 + 罚掉剩余时间（早死不该省下时间成本）----
         # room_left 同样按死亡结算：被打死/被传走都算这一局失败。
+        #
+        # 剩余时间必须用**游戏帧**折算，不能用实测 fps：
+        #   * 每步时间代价 = time_price * frame_skip/60 （按"60 帧 = 1 秒"记账）
+        #   * 剩余秒数     = 剩余步数   * frame_skip/60
+        # 两者用同一个基准，"早死省下的时间代价"正好被"死亡惩罚"抵掉，
+        # 净惩罚只剩固定的 DEATH —— 这才是原本的设计意图。
+        #
+        # 之前用 (max_steps-steps)/fps，一旦游戏帧率不是 60 就会失衡：
+        # 用户机器实测 112fps 时，时间代价速率是死亡惩罚速率的 1.87 倍，
+        # 等于「死得早反而省钱」，反向鼓励送死。改成按帧记账后与帧率无关。
         dead = (hp_now <= 0) or room_left
         if dead:
-            remaining_s = max(0.0, (self.max_steps - self.steps) / self.fps)
+            remaining_s = max(0.0, (self.max_steps - self.steps)
+                              * self.frame_skip / 60.0)
             r -= DEATH + self.cost_miss * min(remaining_s, 30.0)
 
         # 起点就已清空时不把"clear"当终止条件，避免 reset 死循环

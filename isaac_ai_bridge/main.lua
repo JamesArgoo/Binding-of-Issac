@@ -375,7 +375,8 @@ function mod:onUpdate()
 
     -- 把"上一帧模组自身耗时(ms)"一并带上：如果它接近帧预算(33ms@30fps)，
     -- 说明是模组在拖慢游戏，先优化模组而不是加机器。
-    result.mod_ms = r1(last_cost_ms)
+    -- 用 3 位小数：模组通常只有 0.0x ms，1 位小数会被四舍五入成 0。
+    result.mod_ms = math.floor(last_cost_ms * 1000 + 0.5) / 1000
     local payload = json.encode(result) .. "\n"
     last_cost_ms = (os.clock() - t0) * 1000
     sock_send(payload)

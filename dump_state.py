@@ -92,10 +92,13 @@ def show_channel(state, feed=None, has_grid=False, has_map=False):
         ("实测帧率", f"{feed.fps:.1f} fps" if (feed and feed.fps) else
          ("(需 ≥1.5 秒样本，加 --frames 60)" if feed else "(demo)"),
          "模组每帧发一次；决策频率 = 帧率 ÷ frame_skip"),
-        ("模组耗时", (f"{state.get('mod_ms', 0):.2f} ms/帧"
-                   if state.get("mod_ms") else "(首帧还没有上一帧的测量值)")
-         if state.get("mod_ms") is not None else "(旧版模组未上报)",
-         "build_state+JSON 编码；超过 ~8ms 就是模组在拖慢游戏"),
+        ("模组耗时", (f"{state.get('mod_ms', 0):.3f} ms/帧"
+                   if state.get("mod_ms") is not None else "(旧版模组未上报)")
+         + ("  （本帧还没测过，多取几帧）" if not state.get("mod_ms") else ""),
+         "build_state+JSON 编码；占帧预算(1/fps)多少就是模组拖了多少"),
+        ("每帧预算", (f"{1000.0 / feed.fps:.1f} ms" if (feed and feed.fps)
+                   else "(需 ≥1.5 秒样本)"),
+         "游戏帧率决定；模组耗时 / 这个值 = 模组的 CPU 占比"),
         ("房间类型", D.room_type_name(state.get("room", {}).get("type", -1)),
          "room.type"),
         ("房间索引", state.get("room", {}).get("index"),
