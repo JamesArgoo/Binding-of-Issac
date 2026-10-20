@@ -162,12 +162,20 @@ class ParallelIsaacVecEnv(VecEnv):
         for i, (o, r, term, trunc, info) in enumerate(results):
             terminal_obs = o
             if term or trunc:
-                o, info = self.envs[i].reset()
-                info = dict(info or {})
+                # 关键：先留住**这一步**的 info（里面有本回合累计的
+                # dealt / hurt / clear / hurt_fail，诊断全靠它），
+                # 再去 reset 拿下一回合的观测。原来直接 `o, info = reset()`
+                # 把终局 info 覆盖掉了，导致进度行里"平均受伤/输出/清房率"永远 0。
+                step_info = dict(info or {})
+                o, reset_info = self.envs[i].reset()
+                info = step_info
+                if reset_info:
+                    info.setdefault("reset", reset_info)
                 info["terminal_observation"] = terminal_obs
                 info["TimeLimit.truncated"] = bool(trunc and not term)
                 dones.append(True)
             else:
+                info = dict(info or {})
                 dones.append(False)
             obs.append(o)
             rews.append(float(r))
