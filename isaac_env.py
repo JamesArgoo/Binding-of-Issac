@@ -344,13 +344,16 @@ def line_of_fire(state, grid):
     大量打在墙上，这些发数全被算成"打空"，命中率被拉低、时间代价被拉高。
     """
     blocked = (2, 3, 4)          # 物体 / 实心 / 墙
-    out = [LOS_MAX_CELLS] * LOS_DIM
+    # 没有地形时说"一路畅通"是危险的假信息（会鼓励它乱开枪）。
+    # 反向对齐地形块：grid 缺失时地形块全是 0（哪里都走不了），
+    # 所以视线也给 0（哪里都打不通），两者语义一致。
     if not grid:
-        return [v / LOS_MAX_CELLS for v in out]
+        return [0.0] * LOS_DIM
     p = state.get("player", {})
     gidx = p.get("grid_idx")
     if gidx is None:
-        return [v / LOS_MAX_CELLS for v in out]
+        return [0.0] * LOS_DIM
+    out = [LOS_MAX_CELLS] * LOS_DIM
     w, h = grid["w"], grid["h"]
     coll = grid.get("coll") or []
     gx, gy = int(gidx) % w, int(gidx) // w

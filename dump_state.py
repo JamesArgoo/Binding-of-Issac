@@ -89,9 +89,11 @@ def show_channel(state, feed=None, has_grid=False, has_map=False):
     sec("① 通路状态")
     rows = [
         ("frame", state.get("frame", "?"), "游戏逻辑帧计数"),
-        ("实测帧率", f"{feed.fps:.1f} fps" if (feed and feed.fps) else "(demo/未知)",
-         "模组每帧发一次"),
-        ("模组耗时", f"{state.get('mod_ms', 0):.2f} ms/帧"
+        ("实测帧率", f"{feed.fps:.1f} fps" if (feed and feed.fps) else
+         ("(需 ≥1.5 秒样本，加 --frames 60)" if feed else "(demo)"),
+         "模组每帧发一次；决策频率 = 帧率 ÷ frame_skip"),
+        ("模组耗时", (f"{state.get('mod_ms', 0):.2f} ms/帧"
+                   if state.get("mod_ms") else "(首帧还没有上一帧的测量值)")
          if state.get("mod_ms") is not None else "(旧版模组未上报)",
          "build_state+JSON 编码；超过 ~8ms 就是模组在拖慢游戏"),
         ("房间类型", D.room_type_name(state.get("room", {}).get("type", -1)),
@@ -488,7 +490,8 @@ def _grid_series(frames):
 def main():
     ap = argparse.ArgumentParser(description="以撒模组数据探针")
     ap.add_argument("--port", type=int, default=48532)
-    ap.add_argument("--frames", type=int, default=1, help="收集多少帧（>1 才有取值统计）")
+    ap.add_argument("--frames", type=int, default=60,
+                    help="收集多少帧（默认 60 ≈ 2 秒，够算帧率和 mod_ms；>1 才有取值统计）")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--json", type=str, default=None, help="把这些帧的原始 JSON 存到文件")
     ap.add_argument("--demo", action="store_true", help="不连游戏，用合成数据看效果")
