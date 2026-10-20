@@ -23,10 +23,19 @@ from train_multi import build_envs
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="models/multi_355000_steps.zip")
+    ap.add_argument("--model", default="latest",
+                    help="模型路径；默认 latest = models/ 下最新的 checkpoint")
     ap.add_argument("--stochastic", action="store_true")
     ap.add_argument("--catalog", default="room_catalog.json")
     args = ap.parse_args()
+
+    from train_multi import resolve_model_path
+    try:
+        args.model = resolve_model_path(args.model)
+    except FileNotFoundError as exc:
+        print(exc)
+        return 1
+    print(f"使用模型 {args.model}")
 
     model = PPO.load(args.model, device="cpu")
     from isaac_env import (TERRAIN_FULL, TERRAIN_LOCAL, obs_dim,

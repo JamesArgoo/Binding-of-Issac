@@ -31,11 +31,20 @@ from train_multi import load_variants
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="models/combat_v2.zip")
+    ap.add_argument("--model", default="latest",
+                    help="模型路径；默认 latest = models/ 下最新的 checkpoint")
     ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--catalog", default="room_catalog.json")
     ap.add_argument("--stochastic", action="store_true", help="用随机策略而不是取最大概率动作")
     args = ap.parse_args()
+
+    from train_multi import resolve_model_path
+    try:
+        args.model = resolve_model_path(args.model)
+    except FileNotFoundError as exc:
+        print(exc)
+        return 1
+    print(f"使用模型 {args.model}")
 
     from stable_baselines3 import PPO
     from isaac_env import TERRAIN_FULL, TERRAIN_LOCAL, obs_dim, terrain_mode_from_dim

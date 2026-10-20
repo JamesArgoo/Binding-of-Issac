@@ -36,6 +36,51 @@ from isaac_env import (OBS_DIM, TERRAIN_FULL, TERRAIN_LOCAL, IsaacEnv, obs_dim,
                        terrain_mode_from_dim)
 
 
+def resolve_model_path(path, models_dir="models"):
+    """把 --model 的输入解析成真实存在的模型文件。
+
+    支持：
+      * "latest" / None  -> 自动挑 models/ 下最新的 checkpoint
+      * 少写 .zip 或多写 .zip 都能认（SB3 自己补 .zip 会拼成 foo.zip.zip，
+        报错信息完全看不出问题在哪，这里提前处理掉）
+
+    找不到时抛 FileNotFoundError，附上现有模型清单（按时间倒序）。
+    """
+    import glob
+    import os
+
+    def _pick_latest():
+        cands = [p for p in glob.glob(os.path.join(models_dir, "*.zip"))]
+        if not cands:
+            raise FileNotFoundError(f"{models_dir}/ 里没有任何 .zip 模型")
+        cands.sort(key=os.path.getmtime, reverse=True)
+        return cands[0]
+
+    if path is None or str(path).lower() in ("latest", "newest", "@latest"):
+        return _pick_latest()
+
+    p = str(path)
+    for cand in (p, p + ".zip", p[:-4] if p.lower().endswith(".zip") else None):
+        if cand and os.path.isfile(cand):
+            return cand
+
+    lines = [f"✗ 找不到模型文件：{p}"]
+    cands = sorted(glob.glob(os.path.join(models_dir, "*.zip")),
+                   key=os.path.getmtime, reverse=True)[:8]
+    if cands:
+        import time as _t
+        lines.append(f"  {models_dir}/ 下最近的模型：")
+        for c in cands:
+            stamp = _t.strftime("%m-%d %H:%M", _t.localtime(os.path.getmtime(c)))
+            lines.append(f"    {stamp}  {os.path.basename(c)}"
+                         f"  ({os.path.getsize(c) // 1024} KB)")
+        lines.append(f"  提示：直接用 --model latest 就会选最新的那个。")
+    else:
+        lines.append(f"  {models_dir}/ 下没有任何 .zip；训练中断时"
+                     f"CheckpointCallback 会每 5000 步存一个，看看 models/ 目录。")
+    raise FileNotFoundError("\n".join(lines))
+
+
 def peek_obs_dim(path):
     """不开模型就读出它训练时的观测维度。
 
@@ -183,7 +228,7 @@ def load_variants(path, min_enemies=None, max_enemies=None):
 
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                min_enemies=None, max_enemies=None, chunk=1,
-               terrain_mode="local"):
+               terrain_mode="local", hit_rew=None, cost_miss=None, fps=None):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -191,7 +236,17 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
 
     terrain_mode: "local"（地形只看玩家周围 7×7，445 维）
                   "full" （地形铺满整间房 28×16×2 通道，1292 维）
+    hit_rew / cost_miss: 奖励尺度。命中奖励和每秒时间代价的**比值**决定瞄准学不学得会
+                  （selftest_learn.py --sweep 实测：每步瞄准信号 <0.1 时 PPO 学不动）
     """
+    kw = {}
+    if hit_rew is not None:
+        kw["hit_rew"] = hit_rew
+    if cost_miss is not None:
+        kw["cost_miss"] = cost_miss
+    if fps is not None:
+        kw["fps"] = fps
+
     if combat:
         from combat_env import CombatEnv
         variants = load_variants(catalog, min_enemies, max_enemies)
@@ -209,7 +264,7 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         if combat:
             envs.append(CombatEnv(adapter, inst.controller,
                                   variants=variants, frame_skip=frame_skip,
-                                  chunk=chunk, terrain_mode=terrain_mode))
+                                  chunk=chunk, terrain_mode=terrain_mode, **kw))
         else:
             envs.append(IsaacEnv(frame_skip=frame_skip, bridge=adapter,
                                  controller=inst.controller))
@@ -240,6 +295,14 @@ def main():
     ap.add_argument("--full-terrain", action="store_true",
                     help="地形铺满整间房（28×16 画布 × 可走/危险 2 通道，观测 445→1292），"
                          "而不是只看玩家周围 7×7")
+    ap.add_argument("--hit-rew", type=float, default=None,
+                    help="每点伤害的奖励，默认 0.2（= 每 5 点伤害 +1）。"
+                         "调大它相对时间代价的比值，瞄准才学得会")
+    ap.add_argument("--cost-miss", type=float, default=None,
+                    help="命中率为 0 时每秒的时间代价，默认 2.0。调小它等于抬高命中奖励的相对权重")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="每秒决策步数，默认 60/frame_skip(=30)。"
+                         "游戏实际只有 ~30fps 时传 15，否则早死和晚死的奖励完全相等")
     ap.add_argument("--n-steps", type=int, default=1024,
                     help="PPO 每次更新收集多少步（越大 advantage 估计越稳）")
     ap.add_argument("--batch", type=int, default=256, help="PPO minibatch 大小")
@@ -308,13 +371,18 @@ def main():
                       min_enemies=args.min_enemies,
                       max_enemies=args.max_enemies,
                       chunk=args.chunk,
-                      terrain_mode=terrain_mode)
+                      terrain_mode=terrain_mode,
+                      hit_rew=args.hit_rew, cost_miss=args.cost_miss,
+                      fps=args.fps)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
     print(f"地形模式 {terrain_mode} → 观测 {odim} 维 "
           + ("（整间房 28×16×2 通道）" if terrain_mode == TERRAIN_FULL
              else "（玩家周围 7×7）"))
+    e0 = envs[0]
+    if hasattr(e0, "hit_rew"):
+        print(f"奖励尺度：命中 {e0.hit_rew}/点伤害   时间代价 {e0.cost_miss}/秒   决策 {e0.fps:.1f} 步/秒")
     # full 地形把输入从 445 拉到 1292，128 宽的两层太窄，加宽到 256
     net_arch = [256, 256] if terrain_mode == TERRAIN_FULL else [128, 128]
 
@@ -340,8 +408,13 @@ def main():
             verbose=1,
         )
 
+    # checkpoint 名字带启动时间戳：CheckpointCallback 的计数每次训练都从 0 开始，
+    # 只用 "multi" 前缀会让新训练**静默覆盖**上一次的同名 checkpoint
+    # （实测：10/20 那次把 10/18 的 multi_5000..45000 全盖掉了）。
+    run_tag = time.strftime("r%m%d-%H%M")
     ckpt = CheckpointCallback(save_freq=max(5000 // max(1, venv.num_envs), 500),
-                              save_path="models", name_prefix="multi")
+                              save_path="models",
+                              name_prefix=f"multi_{run_tag}")
 
     print(f"\n==== 开始训练 {args.steps} 步（{venv.num_envs} 实例并行）====")
     t0 = time.time()

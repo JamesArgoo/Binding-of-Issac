@@ -69,7 +69,9 @@ death  -5 - 2.0*min(剩余秒数, 30)                    # 早死不该省时间
 | `isaac_ai_bridge/main.lua` | 游戏模组：状态上行 + 命令下行 |
 | `isaac_data.py` | 枚举翻译成中文 + 445 维观测对照表 + `StateFeed` 数据源（探针/可视化共用） |
 | `dump_state.py` | **数据探针**：把一帧状态逐字段摊开，看内存里到底有什么 |
-| `viz_viewer.py` | **可视化**：人类看到的房间 vs 网络收到的 445 个数字，并排对照 |
+| `viz_viewer.py` | **可视化**：人类看到的房间 vs 网络收到的观测，并排对照 |
+| `inspect_policy.py` | **离线查策略**：不开游戏，看模型的动作分布/熵/价值，并做"敌人换方向动作跟不跟"的归因实验 |
+| `selftest_learn.py` | **可学性自检**：用同一套观测造可控假环境，验证 PPO 到底能不能学会"朝敌人射" |
 | `isaac_bridge.py` | 状态解析小工具（敌人/敌方子弹/Pickup） |
 | `isaac_env.py` | 观测构建 `build_obs`、网格可走性归一化、危险格 |
 | `combat_env.py` | 单房间战斗环境（奖励 + reset + chunk） |
@@ -129,7 +131,27 @@ python diag_combat.py --model models/combat_v4.zip --episodes 6
 ```
 
 注意：`--full-terrain` 训练的模型不能和 `local` 的模型互换（观测维度不同），
-`--load` 旧模型时必须带上原来的地形模式。
+`--load` 旧模型时会自动按模型自己的观测维度对齐地形模式；`--model latest` 直接选最新 checkpoint。
+
+## 训练不动时先查这两件事（都不用开游戏）
+
+```bash
+# 1) 模型现在到底想干什么：熵接近 100% = 还是随机；归因实验 1/4 = 完全不看敌人
+python inspect_policy.py --model latest
+
+# 2) 这套观测+动作有没有可能学会（可控假环境，几十秒）
+python selftest_learn.py --steps 20000     # 强奖励下能学会 -> 观测没问题
+python selftest_learn.py --sweep           # 扫奖励强度，找"学得动"的阈值
+```
+
+实测结论（2026-10）：真实环境一次命中约 +0.07，每 10~20 步才中一次，
+**每步瞄准信号约 0.005**；而 `--sweep` 显示每步信号低于 ~0.1 时 PPO 完全学不动
+（熵卡在 92%，动作与敌人位置无关）。所以**命中奖励和时间代价的比值**是当前头号瓶颈：
+
+```bash
+python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
+    --hit-rew 1.0 --cost-miss 0.5 --fps 15 --steps 200000
+```
 
 ## 已知约束（踩过的坑，别踩第二遍）
 

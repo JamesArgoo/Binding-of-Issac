@@ -38,7 +38,7 @@ SHOOT_DIRS = [(0, 0), (0, -1), (1, 0), (0, 1), (-1, 0)]   # 0=不射 1=上 2=右
 N_MOVE, N_SHOOT = 9, 5
 
 # ---- 奖励常数（照 AIsaac CombatHitRateHurt / CombatHp）----
-HIT_HP = 5.0            # 每造成 5 点伤害 +1
+HIT_REW = 1.0 / 5.0     # 每造成 1 点伤害的奖励（= 每 5 点伤害 +1）
 KILL = 0.25             # 每杀一个 +0.25
 COST_HIT = 0.5          # 命中率=1 时每秒的时间代价
 COST_MISS = 2.0         # 命中率=0 时每秒的时间代价
@@ -80,9 +80,9 @@ def health_value(h):
     return HP_WEIGHT * _curve(h / HP_FULL)
 
 
-def time_price(rate):
+def time_price(rate, cost_miss=COST_MISS, cost_hit=COST_HIT):
     """命中率 -> 每秒时间代价。命中率越高越便宜（线性插值）。"""
-    return COST_MISS + (COST_HIT - COST_MISS) * min(1.0, max(0.0, float(rate)))
+    return cost_miss + (cost_hit - cost_miss) * min(1.0, max(0.0, float(rate)))
 
 
 class CombatEnv(gym.Env):
@@ -97,12 +97,19 @@ class CombatEnv(gym.Env):
 
     def __init__(self, bridge, controller, variants=(12, 13, 14),
                  frame_skip=2, max_steps=None, seed=None, chunk=1,
-                 terrain_mode=TERRAIN_LOCAL, fps=None):
+                 terrain_mode=TERRAIN_LOCAL, fps=None,
+                 hit_rew=HIT_REW, cost_miss=COST_MISS):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
         self.variants = list(variants) or [12]
         self.frame_skip = frame_skip
+        # 奖励尺度。命中奖励和"时间代价"的**比值**决定瞄准学不学得会：
+        # 实测（selftest_learn.py --sweep）每步瞄准信号低于 ~0.1 时 PPO 完全学不动，
+        # 熵会一直卡在 92%。真实环境一次命中约 +0.07、每 10~20 步才中一次
+        # -> 每步约 0.005，正好落在这个学不动的区间里。所以这两个值要一起调。
+        self.hit_rew = float(hit_rew)
+        self.cost_miss = float(cost_miss)
         # 决策频率（步/秒）。默认假设游戏跑满 60fps；实测只有 ~30fps 时应该传 15，
         # 否则"早死"和"晚死"的奖励会完全相等（见文件顶部 FPS 的注释）。
         self.fps = float(fps) if fps else 60.0 / max(1, frame_skip)
@@ -358,9 +365,9 @@ class CombatEnv(gym.Env):
         rate = self.hit_rate()
 
         r = 0.0
-        r += max(0.0, dealt) / HIT_HP
+        r += max(0.0, dealt) * self.hit_rew
         r += kills * KILL
-        r -= time_price(rate) * (self.frame_skip / 60.0)
+        r -= time_price(rate, self.cost_miss, COST_HIT) * (self.frame_skip / 60.0)
 
         # ---- 顶墙/顶障碍物惩罚 ----
         #     想走的方向是墙、石头、便便就直接扣分：逼 AI 别对着障碍物干瞪眼。
@@ -410,7 +417,7 @@ class CombatEnv(gym.Env):
         dead = (hp_now <= 0) or room_left
         if dead:
             remaining_s = max(0.0, (self.max_steps - self.steps) / self.fps)
-            r -= DEATH + COST_MISS * min(remaining_s, 30.0)
+            r -= DEATH + self.cost_miss * min(remaining_s, 30.0)
 
         # 起点就已清空时不把"clear"当终止条件，避免 reset 死循环
         terminated = bool(dead or (cleared and not room_left and not self._started_clear))
