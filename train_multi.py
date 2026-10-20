@@ -121,9 +121,13 @@ class ParallelIsaacVecEnv(VecEnv):
     """
 
     def __init__(self, envs):
+        # 必须先挂上 self.envs 再调 super().__init__：
+        # SB3 的 VecEnv.__init__ 里会 get_attr("render_mode")，它走的是
+        # self.envs[i]；envs 还没赋值就会抛 AttributeError，被 SB3 捕获后
+        # 打出那条 "render_mode attribute is not defined" 的 UserWarning。
+        self.envs = envs
         super().__init__(len(envs), envs[0].observation_space, envs[0].action_space)
         self.render_mode = None
-        self.envs = envs
         self._actions = None
         self._lock = threading.Lock()
 
