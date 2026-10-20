@@ -177,6 +177,39 @@ python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
 python inspect_policy.py
 ```
 
+## 阶段化训练：先学不挨打，再学打输出
+
+`--hit-rew 1.0` 把命中奖励抬上去之后出现了一个副作用：**一个回合打出的伤害值约 28 分，
+而掉光 6 点血只扣 11.95 分 —— 打输出比挨打"贵"2.3 倍，于是贴脸换血成了最优解**
+（实测回合回报 +5.6，同时每回合掉光血）。
+
+按阶段调：
+
+```bash
+# 阶段 A：重罚受伤（10 倍），先把它从"撞怪换血"掰回来
+python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
+    --load models/bc_seed2 --hit-rew 1.0 --cost-miss 0.5 --reset-mode keep \
+    --hurt-scale 10 --steps 200000
+
+# 阶段 B：等"平均受伤"降下来之后，加严格版"不允许受伤"
+python train_multi.py --attach --combat --full-terrain --max-enemies 2 \
+    --load latest --hit-rew 1.0 --cost-miss 0.5 \
+    --hurt-scale 10 --fail-on-hurt --steps 200000
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--hurt-scale N` | 受伤惩罚倍率（默认 1.0）。`10` 时掉 1 点血 ≈ 3 次泪弹命中，能压过换血收益 |
+| `--fail-on-hurt` | 掉**任何**一点血就结束本回合（不加死亡惩罚）。会自动把 `--reset-mode` 改回 `restart` |
+
+进度行第二行直接给这三个数，用来判断"学会躲没有"：
+
+```
+  最近 30 回合：平均受伤 0.42 点  平均输出 26 伤害  清房率 87%
+```
+
+`平均受伤` 从 6 降到 1 以下，就说明躲避学会了。
+
 ## 怎么练得快（实测瓶颈与放大倍数）
 
 `time/fps` 的物理上限是 **游戏逻辑帧率 ÷ frame_skip**。项目原来的数字（单实例

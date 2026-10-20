@@ -98,7 +98,8 @@ class CombatEnv(gym.Env):
     def __init__(self, bridge, controller, variants=(12, 13, 14),
                  frame_skip=2, max_steps=None, seed=None, chunk=1,
                  terrain_mode=TERRAIN_LOCAL, fps=None,
-                 hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart"):
+                 hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart",
+                 hurt_scale=1.0, fail_on_hurt=False):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
@@ -116,6 +117,14 @@ class CombatEnv(gym.Env):
         #            而实测回合本身只有 ~180 步（6 秒），重开能吃掉 30-40% 的训练时间。
         #            代价：血量会跨回合累积（死了模组照样会自动重开，等于回满血）。
         self.reset_mode = reset_mode
+        # 受伤惩罚倍率。默认 1.0（= AIsaac 的凹形血量曲线，掉光 6 点血约 -1.2 缩放分）。
+        # 但命中奖励 --hit-rew 调到 1.0 之后，一个回合打出的伤害值 ~28 分，
+        # 而掉光血只扣 11.95 分 —— 打输出比挨打贵 2.3 倍，于是"贴脸换血"成了最优解。
+        # 想让 AI 学会躲，就得把这个倍数拉到能压过输出收益（实测 10 左右起效）。
+        self.hurt_scale = float(hurt_scale)
+        # "不允许受伤"的严格版：掉任何一点血就结束本回合（不给 DEATH 惩罚，
+        # 因为这是课程阶段的手段，不是真死亡）。
+        self.fail_on_hurt = bool(fail_on_hurt)
         self.last_reset_s = 0.0     # 上一次 reset 花了多少秒（诊断）
         self.last_ep_steps = 0      # 上一回合走了多少步（诊断）
         # 决策频率（步/秒）。默认假设游戏跑满 60fps；实测只有 ~30fps 时应该传 15，
@@ -402,9 +411,12 @@ class CombatEnv(gym.Env):
         # ---- 受伤：凹形血量曲线，越接近死亡掉血越贵 ----
         #     之前照抄的 hit-rate 配置里压根没有这一项（那是"玩家无敌"的实验配置），
         #     所以 AI 完全没有躲怪的动机，会直接往怪身上撞。
-        if hp_now < self._prev_hp:
+        #     hurt_scale 用来压过"贴脸换血"的收益，fail_on_hurt 用来实现
+        #     "本阶段不允许受伤"（掉血即终局）。
+        took_damage = hp_now < self._prev_hp
+        if took_damage:
             hurt = health_value(self._prev_hp) - health_value(hp_now)
-            r -= hurt
+            r -= hurt * self.hurt_scale
             self._ep_hurt += hurt
 
         # ---- 对齐势（potential-based，不改变结果排序）----
@@ -450,13 +462,23 @@ class CombatEnv(gym.Env):
                               * self.frame_skip / 60.0)
             r -= DEATH + self.cost_miss * min(remaining_s, 30.0)
 
+        # ---- 本阶段"不允许受伤"：掉血即终局 ----
+        # 注意这里**不**追加 DEATH 惩罚：这是课程手段，不是真死亡。
+        # 真正的惩罚是"丢掉后续清房奖励 + 已经扣掉的受伤分"。
+        hurt_fail = bool(self.fail_on_hurt and took_damage and not dead)
+        if hurt_fail:
+            terminated_extra = True
+        else:
+            terminated_extra = False
+
         # 起点就已清空时不把"clear"当终止条件，避免 reset 死循环
-        terminated = bool(dead or (cleared and not room_left and not self._started_clear))
+        terminated = bool(dead or hurt_fail
+                          or (cleared and not room_left and not self._started_clear))
 
         info = {
             "dealt": dealt, "kills": kills, "fired": fired,
             "hit_rate": rate, "clear": cleared, "dead": dead,
-            "left_room": room_left,
+            "left_room": room_left, "hurt_fail": hurt_fail,
             "hurt": self._ep_hurt, "wall": self._ep_wall,
             "ep_dealt": self._ep_dealt, "ep_fired": self._ep_fired,
         }

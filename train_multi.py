@@ -253,6 +253,10 @@ class ProgressCallback(BaseCallback):
         self.last_steps = 0
         self.episodes = 0
         self.ep_rews = []
+        self.ep_hurts = []
+        self.ep_dealts = []
+        self.clear_cnt = 0
+        self.hurtfail_cnt = 0
 
     def _on_step(self):
         now = time.time()
@@ -267,6 +271,15 @@ class ProgressCallback(BaseCallback):
                 self.episodes += 1
                 self.ep_rews.append(float(ep.get("r", 0.0)))
                 self.ep_rews = self.ep_rews[-30:]
+                # 受伤 / 输出 / 清房率 是"学会躲没有"最直接的指标
+                self.ep_hurts.append(float(info.get("hurt", 0.0) or 0.0))
+                self.ep_hurts = self.ep_hurts[-30:]
+                self.ep_dealts.append(float(info.get("ep_dealt", 0.0) or 0.0))
+                self.ep_dealts = self.ep_dealts[-30:]
+                if info.get("clear"):
+                    self.clear_cnt += 1
+                if info.get("hurt_fail"):
+                    self.hurtfail_cnt += 1
 
         if now - self.last_t < self.every:
             return True
@@ -301,6 +314,14 @@ class ProgressCallback(BaseCallback):
         print(f"  [{dt_all:6.0f}s] {steps:>7} 步  "
               f"本段 {rate_win:5.1f} / 平均 {rate_avg:5.1f} 步/秒  "
               f"完成 {self.episodes} 回合{recent}{extra}{eta}")
+        if self.ep_hurts:
+            avg_hurt = sum(self.ep_hurts) / len(self.ep_hurts)
+            avg_dealt = sum(self.ep_dealts) / len(self.ep_dealts)
+            clr = 100.0 * self.clear_cnt / max(1, self.episodes)
+            hf = (f"  因受伤终止 {self.hurtfail_cnt}"
+                  if self.hurtfail_cnt else "")
+            print(f"           最近 30 回合：平均受伤 {avg_hurt:.2f} 点  "
+                  f"平均输出 {avg_dealt:.0f} 伤害  清房率 {clr:.0f}%{hf}")
         return True
 
 
@@ -331,7 +352,7 @@ def measure_game_fps(adapter, seconds=1.5):
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                min_enemies=None, max_enemies=None, chunk=1,
                terrain_mode="local", hit_rew=None, cost_miss=None, fps=None,
-               reset_mode="restart"):
+               reset_mode="restart", hurt_scale=None, fail_on_hurt=False):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -349,6 +370,14 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         kw["cost_miss"] = cost_miss
     if fps is not None:
         kw["fps"] = fps
+    if hurt_scale is not None:
+        kw["hurt_scale"] = hurt_scale
+    kw["fail_on_hurt"] = bool(fail_on_hurt)
+    # fail_on_hurt + keep 不相容：keep 不重开，血量会一路往下掉，
+    # 于是"掉血即结束"的回合越跑越短、最后卡在濒死状态。这种组合强制整局重开。
+    if fail_on_hurt and reset_mode == "keep":
+        print("⚠ --fail-on-hurt 需要每回合满血，已把 reset-mode 从 keep 改回 restart")
+        reset_mode = "restart"
     kw["reset_mode"] = reset_mode
 
     if combat:
@@ -402,6 +431,13 @@ def main():
                          "keep=玩家活着就只 goto 下一间房，不重开。"
                          "实测回合只有 ~180 步（6 秒）而重开要 2-4 秒，"
                          "keep 能省掉 30-40% 的训练时间")
+    ap.add_argument("--hurt-scale", type=float, default=None,
+                    help="受伤惩罚倍率（默认 1.0）。--hit-rew 调到 1.0 后，一个回合"
+                         "打出的伤害约 28 分、掉光血只扣 12 分，于是贴脸换血最优；"
+                         "想让它学会躲，把这里拉到 10 左右")
+    ap.add_argument("--fail-on-hurt", action="store_true",
+                    help="「不允许受伤」：掉任何一点血就结束本回合（不加死亡惩罚）。"
+                         "适合先练躲避的课程阶段")
     ap.add_argument("--save-every", type=int, default=25000,
                     help="每训练多少总步数存一个 checkpoint（默认 25000）。"
                          "多开 + 高帧率下吞吐能到几百步/秒，按步数存会一秒一个、"
@@ -511,7 +547,8 @@ def main():
                       frame_skip=args.frame_skip,
                       terrain_mode=terrain_mode,
                       hit_rew=args.hit_rew, cost_miss=args.cost_miss,
-                      fps=decision_fps, reset_mode=args.reset_mode)
+                      fps=decision_fps, reset_mode=args.reset_mode,
+                      hurt_scale=args.hurt_scale, fail_on_hurt=args.fail_on_hurt)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
@@ -520,7 +557,12 @@ def main():
              else "（玩家周围 7×7）"))
     e0 = envs[0]
     if hasattr(e0, "hit_rew"):
-        print(f"奖励尺度：命中 {e0.hit_rew}/点伤害   时间代价 {e0.cost_miss}/秒   决策 {e0.fps:.1f} 步/秒")
+        print(f"奖励尺度：命中 {e0.hit_rew}/点伤害   时间代价 {e0.cost_miss}/秒   "
+              f"受伤 x{e0.hurt_scale}   决策 {e0.fps:.1f} 步/秒")
+        if e0.fail_on_hurt:
+            print("  课程：不允许受伤 —— 掉任何一点血就结束本回合")
+        print(f"  回合重置：{e0.reset_mode}"
+              + ("" if e0.reset_mode == "restart" else "（不整局重开，血量跨回合累积）"))
     # full 地形把输入从 445 拉到 1292，128 宽的两层太窄，加宽到 256
     net_arch = [256, 256] if terrain_mode == TERRAIN_FULL else [128, 128]
 
