@@ -51,6 +51,9 @@ death  -5 - 2.0*min(剩余秒数, 30)                    # 早死不该省时间
 | 文件 | 作用 |
 |---|---|
 | `isaac_ai_bridge/main.lua` | 游戏模组：状态上行 + 命令下行 |
+| `isaac_data.py` | 枚举翻译成中文 + 445 维观测对照表 + `StateFeed` 数据源（探针/可视化共用） |
+| `dump_state.py` | **数据探针**：把一帧状态逐字段摊开，看内存里到底有什么 |
+| `viz_viewer.py` | **可视化**：人类看到的房间 vs 网络收到的 445 个数字，并排对照 |
 | `isaac_bridge.py` | 状态解析小工具（敌人/敌方子弹/Pickup） |
 | `isaac_env.py` | 观测构建 `build_obs`、网格可走性归一化、危险格 |
 | `combat_env.py` | 单房间战斗环境（奖励 + reset + chunk） |
@@ -60,6 +63,31 @@ death  -5 - 2.0*min(剩余秒数, 30)                    # 早死不该省时间
 | `eval_combat.py` / `diag_combat.py` / `test_combat.py` | 评估 / 诊断 / 自检 |
 | `test_multi.py` / `probe.py` | 多开启动验证 / socket 探针 |
 | `ai_basic_4.py` | 规则AI（8方向移动 + 4方向甩枪），备选与对照 |
+
+## 先看清 AI 能看到什么（改观测/调奖励前必做）
+
+```bash
+# 不开游戏，直接看效果
+python dump_state.py --demo --frames 30
+python viz_viewer.py --demo --snapshot demo_viz.png     # 存一张图慢慢看
+
+# 开着游戏（steam 启动项带 --luadebug，模组已启用，且已经进了一局）
+python dump_state.py --frames 120 --json frames.json
+python viz_viewer.py
+```
+
+`dump_state.py` 输出七段：通路状态 / 玩家字段全表 / 实体明细 / 地形（含字符画、
+`coll` `ent` 直方图、危险格）/ 门与地图 / **445 维观测逐维** / 多帧取值统计
+（会点出"哪些维全程恒定 = 死输入"）。
+
+`viz_viewer.py` 一张图里六个面板：① 世界俯视图（人类视角，含 7×7 地形视野框）
+② AI 的地形视野 7×7 ③ 敌人槽位 16×8 ④ 敌弹槽位 5×48 ⑤ 状态与覆盖率 ⑥ 445 维分块强度。
+
+看这两个工具能立刻发现的两个观测缺陷：
+
+- **地形只喂了玩家周围 7×7**，房间另一头的石头/坑 AI 完全不知道；
+- **`grid.ent`（每格是石头/便便/坑/尖刺）收到了却没用**，观测里只剩 `coll` 二值，
+  所以"石头"和"便便"、"墙"和"实心障碍"在 AI 眼里长得一模一样。
 
 ## 用法
 
@@ -77,6 +105,9 @@ python diag_combat.py --model models/combat_v4.zip --episodes 6
 
 ## 已知约束（踩过的坑，别踩第二遍）
 
+- **必须带 `python` 前缀**：Windows 把 `.py` 关联到 `C:\Windows\py.exe`，它默认用
+  `D:\Python313\python.exe` —— 不是激活的 Issac_env。直接敲 `dump_state.py` 会报
+  `No module named 'gymnasium'`（pip 装到的和脚本跑的不是同一个 Python）。
 - **必须设工作目录**：启动 exe 要 `cwd=游戏目录`，否则找不到 `resources/`，着色器全失败直接崩。
 - **Steam 默认只允许一个实例**：要设 `SteamAppId` / `SteamGameId` / `SteamClientLaunch`
   伪装成"由 Steam 启动"，绕过 `SteamAPI_RestartAppIfNecessary`。
