@@ -213,13 +213,33 @@ class ParallelIsaacVecEnv(VecEnv):
                 for i in self._resolve(indices)]
 
 
-def load_variants(path, min_enemies=None, max_enemies=None):
+def load_variants(path, min_enemies=None, max_enemies=None,
+                  enemy_types=None, exclude_enemy_types=None):
     """从 room_catalog.py 探出的目录里取有敌人的房间 variant 列表。
 
     min/max_enemies 用来做**课程学习**：先只练 1~3 个敌人的房间降低方差，
     练稳了再放开到全难度（AIsaac 的 TaskSampler 也是按权重分难度的思路）。
+
+    enemy_types / exclude_enemy_types 是按**敌人类型**筛（逗号分隔的类型 id）。
+    只按数量筛的话方差仍然很大：624 个战斗房间里有几十种行为完全不同的敌人
+    （静止接触伤害的 226、射 8 路环形弹幕的 249、走位追击的 10 ……），
+    混在一起练等于每回合换一道新题。按类型筛才能让同一个技能被反复练到。
     """
     import json
+
+    def _ids(s):
+        if s is None:
+            return None
+        if isinstance(s, (int, float)):
+            return {int(s)} or None
+        if isinstance(s, str):
+            parts = [p.strip() for p in s.replace(" ", ",").split(",")]
+            return {int(p) for p in parts if p} or None
+        return {int(x) for x in s} or None
+
+    allow = _ids(enemy_types)
+    deny = _ids(exclude_enemy_types)
+
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     combat = data.get("combat") or []
@@ -232,11 +252,18 @@ def load_variants(path, min_enemies=None, max_enemies=None):
             continue
         if max_enemies is not None and n > max_enemies:
             continue
+        types = {int(e.get("type", 0)) for e in (r.get("enemies") or [])}
+        if allow is not None and not types <= allow:
+            continue                    # 房间里出现任何"没点名"的敌人都不要
+        if deny is not None and (types & deny):
+            continue                    # 掺了要排除的敌人也不要
         picked.append(int(r["variant"]))
     variants = sorted(set(picked))
     if not variants:
         raise SystemExit(
-            f"{path} 里没有符合条件的房间（min={min_enemies} max={max_enemies}），"
+            f"{path} 里没有符合条件的房间（min={min_enemies} max={max_enemies} "
+            f"types={sorted(allow) if allow else None} "
+            f"exclude={sorted(deny) if deny else None}），"
             f"先跑 room_catalog.py 或放宽条件")
     return variants
 
@@ -363,6 +390,7 @@ def measure_game_fps(adapter, seconds=1.5):
 
 def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                min_enemies=None, max_enemies=None, chunk=1,
+               enemy_types=None, exclude_enemy_types=None,
                terrain_mode="local", hit_rew=None, cost_miss=None, fps=None,
                reset_mode="restart", hurt_scale=None, fail_on_hurt=False,
                min_hp=3.0):
@@ -397,7 +425,8 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
 
     if combat:
         from combat_env import CombatEnv
-        variants = load_variants(catalog, min_enemies, max_enemies)
+        variants = load_variants(catalog, min_enemies, max_enemies,
+                                  enemy_types, exclude_enemy_types)
         rng = ""
         if min_enemies is not None or max_enemies is not None:
             rng = f"（敌人数 {min_enemies or 0}~{max_enemies or '∞'} 的课程）"
@@ -438,6 +467,12 @@ def main():
                     help="课程学习：只练敌人数量 >= N 的房间")
     ap.add_argument("--max-enemies", type=int, default=None,
                     help="课程学习：只练敌人数量 <= N 的房间（先易后难）")
+    ap.add_argument("--enemy-types", default=None,
+                    help="课程学习：只练**全部敌人都在这个类型列表里**的房间，"
+                         "逗号分隔的类型 id（如 10,15,16）。"
+                         "只按数量筛方差太大：624 个房间里几十种行为不同的敌人混在一起")
+    ap.add_argument("--exclude-enemy-types", default=None,
+                    help="课程学习：排除包含这些敌人类型的房间（逗号分隔）")
     ap.add_argument("--chunk", type=int, default=1,
                     help="action chunking：一次决策输出连续 N 组动作（借鉴 ACT，建议 2~4）")
     ap.add_argument("--reset-mode", default="restart",
@@ -559,6 +594,8 @@ def main():
     envs = build_envs(mgr, combat=args.combat, catalog=args.catalog,
                       min_enemies=args.min_enemies,
                       max_enemies=args.max_enemies,
+                      enemy_types=args.enemy_types,
+                      exclude_enemy_types=args.exclude_enemy_types,
                       chunk=args.chunk,
                       frame_skip=args.frame_skip,
                       terrain_mode=terrain_mode,
