@@ -388,10 +388,11 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
     kw["fail_on_hurt"] = bool(fail_on_hurt)
     kw["min_hp"] = float(min_hp)
     # fail_on_hurt + keep 不相容：keep 不重开，血量会一路往下掉，
-    # 于是"掉血即结束"的回合越跑越短、最后卡在濒死状态。这种组合强制整局重开。
+    # 于是"掉血即结束"的回合越跑越短、最后卡在濒死状态。
+    # auto 没这个问题（血量低于 min_hp 就会重开补满），所以只有 keep 需要拦。
     if fail_on_hurt and reset_mode == "keep":
-        print("⚠ --fail-on-hurt 需要每回合满血，已把 reset-mode 从 keep 改回 restart")
-        reset_mode = "restart"
+        print("⚠ --fail-on-hurt 需要周期补满血，已把 reset-mode 从 keep 改回 auto")
+        reset_mode = "auto"
     kw["reset_mode"] = reset_mode
 
     if combat:
