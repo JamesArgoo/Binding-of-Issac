@@ -17,6 +17,7 @@ ai_basic_4.py —— 规则版 AI：8 方向移动 + 4 方向射击（甩泪）
 """
 import argparse
 import math
+from collections import deque
 import time
 
 import cv2
@@ -179,7 +180,33 @@ def _neighbor_room_grid(room_grid, slot):
     return room_grid + {0: -13, 1: 1, 2: 13, 3: -1}.get(slot, 0)
 
 
-def _go_to_door(state, grid, last_door=None):
+def next_room_toward_unexplored(state, cur_room):
+    """在楼层图上 BFS，返回"朝最近未探索房间走的第一个房间网格号"。
+
+    楼层网格是 13x13，房间 grid 的邻居是 ±1（左右）和 ±13（上下）。
+    返回 None 表示全图都探索过了（或者地图数据缺失）。
+
+    为什么需要它：贪心地"每到一个房间就选一个门"在一条直线的房间串里
+    会退化成来回巡逻（A-B-C-D 走完一圈又回 A）。图搜索能直接给出目标方向。
+    """
+    rooms = {r["grid"]: r for r in state.get("map", [])}
+    if not rooms or cur_room not in rooms:
+        return None
+    q = deque([(cur_room, None)])
+    seen = {cur_room}
+    while q:
+        r, first = q.popleft()
+        if r != cur_room and int(rooms.get(r, {}).get("visited", 0)) == 0:
+            return first
+        for delta in (-1, 1, -13, 13):
+            nr = r + delta
+            if nr in rooms and nr not in seen:
+                seen.add(nr)
+                q.append((nr, nr if first is None else first))
+    return None
+
+
+def _go_to_door(state, grid, last_door=None, recent=None):
     """房间清空时，走到最近的开门。返回 8 方向 (mx, my)。"""
     p = get_player(state)
     if grid is None or p.get("grid_idx") is None:
@@ -197,12 +224,36 @@ def _go_to_door(state, grid, last_door=None):
     # 永远遇不到敌人（录了4分钟只走了2个房间）。
     room_grid = state["room"]["index"]
     visited = {r["grid"]: r["visited"] for r in state.get("map", [])}
-    fresh = [d for d in open_doors
-             if visited.get(_neighbor_room_grid(room_grid, d.get("slot", -1)), 1) == 0]
 
-    # 其次：避开上一次走过的门，减少原地横跳
-    candidates = fresh or ([d for d in open_doors if d["grid"] != last_door] or open_doors)
-    best = min(candidates, key=gdist)
+    def _ng(d):
+        return _neighbor_room_grid(room_grid, d.get("slot", -1))
+
+    # 按"邻居房间被访问过几次"打分选门 —— 这就是记忆性：
+    #   去过越多次的房间越不去（0 次 = 没去过，最优先）
+    #   最近刚去过的房间强烈回避（治 A-B-A-B 打转）
+    #   刚走过来的那扇门也回避
+    # 这样即使 B 是只有一扇门的死胡同，去过几次后 visit 变大，就不再反复进去了。
+    recent_set = set(recent or [])
+
+    def _door_score(d):
+        ng = _ng(d)
+        v = visited.get(ng, 0)
+        pen = 0
+        if ng in recent_set:
+            pen += 100
+        if d["grid"] == last_door:
+            pen += 50
+        return (v + pen, gdist(d))
+
+    candidates = list(open_doors)
+
+    # 【图搜索优先】BFS 到最近的未探索房间，只走通往它的那扇门
+    target_room = next_room_toward_unexplored(state, room_grid)
+    if target_room is not None:
+        toward = [d for d in open_doors if _ng(d) == target_room]
+        if toward:
+            candidates = toward
+    best = min(candidates, key=_door_score)
     path = astar(grid, p["grid_idx"], best["grid"])
     if path and len(path) >= 2:
         cur, nxt = path[0], path[1]
@@ -308,9 +359,10 @@ def plan_move(state, grid, p, target, enemies, projectiles, debug=None):
             ex_y = p["y"] + d[1] * move_speed * K
             dt = math.hypot(target["x"] - ex_x, target["y"] - ex_y)
             score += 2.0 * max(0.0, 1.0 - dt / max(dist_now, 1.0))
-        # 无威胁时轻微偏好原地，避免无意义漂移
+        # 永不停在原地：原来这里给 (0,0) 加 0.05 分，导致没威胁时它站着不动。
+        # 改成轻微惩罚，让任何安全方向都优先于静止。
         if d == (0, 0):
-            score += 0.05
+            score -= 0.30
         results.append((d, score))
         if score > best_score:
             best_dir, best_score = d, score
@@ -319,7 +371,37 @@ def plan_move(state, grid, p, target, enemies, projectiles, debug=None):
     return best_dir
 
 
-def decide(state, grid, last_door=None, debug=None):
+def _fallback_move(state, grid, p, enemies=None, projectiles=None):
+    """兜底方向：绝不返回 (0,0)。
+
+    原来 _go_to_door 在"房间没清空 / 门没开 / 已站在门上"时会返回 (0,0)，
+    表现就是站在门边发呆。这里改成朝房间中心走（中心通常最开阔），
+    走不了就挑任意可走方向。
+    """
+    if grid is None or p.get("grid_idx") is None:
+        return (0, 0)
+    w, h = grid["w"], grid["h"]
+    gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
+    threats = list(enemies or []) + list(projectiles or [])
+    best, best_key = None, None
+    for d in DIRS8:
+        if not cell_walkable(gx + d[0], gy + d[1], grid):
+            continue
+        # 这一步走完之后的预想世界坐标（一格 40 单位）
+        nx = p["x"] + d[0] * 40.0
+        ny = p["y"] + d[1] * 40.0
+        to_center = abs(gx + d[0] - w // 2) + abs(gy + d[1] - h // 2)
+        if threats:
+            dmin = min(math.hypot(t["x"] - nx, t["y"] - ny) for t in threats)
+            key = (-dmin, to_center)      # 离威胁越远越好，其次靠中心
+        else:
+            key = (0.0, to_center)
+        if best_key is None or key < best_key:
+            best, best_key = d, key
+    return best if best is not None else (0, 0)
+
+
+def decide(state, grid, last_door=None, debug=None, recent=None):
     """返回 (移动x, 移动y, 射击x, 射击y)，均为 8 方向 {-1,0,1}。"""
     p = get_player(state)
     target, enemies = choose_target(state, p)
@@ -327,7 +409,12 @@ def decide(state, grid, last_door=None, debug=None):
 
     # --- 房间清空 / 无敌人：去最近的开门 ---
     if room_clear or target is None:
-        move = _go_to_door(state, grid, last_door)
+        # 兜底走路时也要能躲子弹，所以这里先取一次敌方子弹
+        projectiles = get_enemy_projectiles(state)
+        move = _go_to_door(state, grid, last_door, recent)
+        if move == (0, 0):
+            # 门还没开 / 已经站在门上 —— 不允许原地发呆，朝房间中心走
+            move = _fallback_move(state, grid, p, enemies, projectiles)
         if debug is not None:
             debug["target"] = None
             debug["candidates"] = []
@@ -339,6 +426,8 @@ def decide(state, grid, last_door=None, debug=None):
     # 1) 移动：8 方向候选采样 + 前瞻模拟（综合所有子弹/敌人/墙，避免局部最优）
     projectiles = get_enemy_projectiles(state)
     move = plan_move(state, grid, p, target, enemies, projectiles, debug=debug)
+    if move == (0, 0):
+        move = _fallback_move(state, grid, p, enemies, projectiles)
     if grid is not None and p.get("grid_idx") is not None and move != (0, 0):
         move = wall_steer(move[0], move[1], p["grid_idx"], grid)
 

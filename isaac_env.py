@@ -32,13 +32,64 @@ from isaac_bridge import (IsaacBridge, get_enemies, get_enemy_projectiles, get_p
 # ---- 尺寸参数 ----
 MAX_ENEMIES = 16
 MAX_TEARS = 48
-GRID_WIN = 7  # 7x7 局部网格
 # 玩家特征：x,y,vx,vy,hp,alive + fire_dir(x,y) + head_dir(x,y) + iframes + damage
 #           + shot_speed + move_speed = 14
 PLAYER_DIM = 14
-# 观测维度：
-#   玩家14 + 敌人16*8 + 子弹48*5 + 网格49 + 房间2 + 门12
-OBS_DIM = PLAYER_DIM + MAX_ENEMIES * 8 + MAX_TEARS * 5 + GRID_WIN * GRID_WIN + 2 + 4 * 3  # 445
+
+# ---- 地形编码模式 ----
+# "local"：玩家周围 7×7 局部窗口（旧版，49 维）—— 平移不变、房间尺寸无关，
+#          但实测只覆盖房间 20%，84% 的墙/石头/坑落在盲区里。
+# "full" ：整间房铺到 28×16 固定画布，2 通道（可走 / 危险），896 维 —— 全房间可见。
+#          房间贴画布左上角，画布多出来的部分填 0（和墙一样是"走不了"）。
+TERRAIN_LOCAL = "local"
+TERRAIN_FULL = "full"
+GRID_WIN = 7                       # local 模式的窗口边长
+CANVAS_W, CANVAS_H = 28, 16        # full 模式的画布：标准房间最大外接框
+                                   #   1×1=15×9 / 1×2=15×16 / 2×1=28×9 / 2×2=28×16
+TERRAIN_CHANNELS = 2               # full 模式：ch0 可走, ch1 危险
+
+# ---- 视线（line of fire）----
+# 从玩家所在格沿 4 个射击方向（上/右/下/左，和 SHOOT_DIRS 1..4 对齐）
+# 到第一个"挡子弹"的格子有多远（格数，归一化）。
+# 挡子弹 = 网格碰撞类 2物体/3实心/4墙；坑(1)和开着的门(5)不挡。
+# 没有这 4 个数，AI 只知道"那里走不进去"，不知道"子弹会撞上去"。
+LOS_DIM = 4
+LOS_MAX_CELLS = 15.0               # 超过这个距离就当"一路畅通"
+LOS_DIRS = ((0, -1), (1, 0), (0, 1), (-1, 0))   # 上 右 下 左
+
+TERRAIN_DIMS = {
+    TERRAIN_LOCAL: GRID_WIN * GRID_WIN,                    # 49
+    TERRAIN_FULL: CANVAS_W * CANVAS_H * TERRAIN_CHANNELS,  # 896
+}
+
+
+def terrain_dim(terrain_mode=TERRAIN_LOCAL):
+    """地形块占多少维。"""
+    return TERRAIN_DIMS.get(terrain_mode, TERRAIN_DIMS[TERRAIN_LOCAL])
+
+
+def obs_dim(terrain_mode=TERRAIN_LOCAL):
+    """观测总维度：玩家14 + 敌人16*8 + 子弹48*5 + 地形 + 视线4 + 房间2 + 门12。"""
+    return (PLAYER_DIM + MAX_ENEMIES * 8 + MAX_TEARS * 5
+            + terrain_dim(terrain_mode) + LOS_DIM + 2 + 4 * 3)
+
+
+OBS_DIM = obs_dim(TERRAIN_LOCAL)        # 449
+OBS_DIM_FULL = obs_dim(TERRAIN_FULL)    # 1296
+
+
+def terrain_mode_from_dim(dim):
+    """反查：观测维度 -> 地形模式。
+
+    加载已有模型时必须用它对齐 —— 模型是按 1292 维（full）训的话，
+    环境还用 445 维（local）就会在 predict 时形状不匹配。
+    """
+    for _m in (TERRAIN_LOCAL, TERRAIN_FULL):
+        if obs_dim(_m) == int(dim):
+            return _m
+    raise ValueError(
+        f"观测维度 {dim} 不对应任何已知地形模式"
+        f"（local={obs_dim(TERRAIN_LOCAL)}, full={obs_dim(TERRAIN_FULL)}）")
 
 # Direction 枚举: 0=左 1=上 2=右 3=下
 _DIR_XY = {0: (-1.0, 0.0), 1: (0.0, -1.0), 2: (1.0, 0.0), 3: (0.0, 1.0)}
@@ -146,12 +197,24 @@ def normalize_grid(grid):
 
 HAZARD_PAD = 28.3   # 危险判定半径的修正量，照 AIsaac abplus_obs._terrain_with_hazards
 
+# 子弹类实体：泪(2) 激光(7) 刀(8) 投射物(9)
+_PROJECTILE_TYPES = (2, 7, 8, 9)
+
 
 def _hazard_cells(state, grid):
     """带接触伤害的实体（火堆、火焰等）会伤到的格子集合。
 
     AIsaac 的做法：cdmg > 0 的实体，凡是格心到它中心距离 <= size + 28.3 的格子都算危险。
     没有这个，AI 完全看不见火堆，只能靠掉血后才知道疼。
+
+    **实测踩过的坑（2026-10 用真数据查出来）**：原判据只跳过玩家本体 `type == 1`，
+    于是玩家自己射出的泪弹（`type=2 spawner_type=1 cdmg=3.5`）也被标成危险格 ——
+    那一帧 7×7 视野里唯一的 0.5 就是玩家刚打出去的那发子弹，等于在教 AI
+    "别站在自己子弹的位置"。现在同时跳过：玩家本体、玩家发射的一切、所有弹幕。
+
+    弹幕不进危险格的理由：弹幕块（5×48）已经有精确位置和速度用于预判，而地形
+    每 15 帧才刷新一次，把会动的东西画进地形只会得到过期 250ms 的噪声，
+    还会让"地形"这个本该静态的通道时刻抖动。
     """
     if not grid:
         return frozenset()
@@ -169,7 +232,13 @@ def _hazard_cells(state, grid):
             cdmg = float(e.get("cdmg", 0) or 0)
         except (TypeError, ValueError):
             continue
-        if cdmg <= 0 or e.get("type") == 1:      # 玩家自己不算
+        if cdmg <= 0:
+            continue
+        if int(e.get("type", 0)) == 1:                          # 玩家本体
+            continue
+        if int(e.get("spawner_type", 0) or 0) == 1:             # 玩家发射的东西
+            continue
+        if int(e.get("type", 0)) in _PROJECTILE_TYPES:          # 会动的弹幕
             continue
         r = float(e.get("size", 10.0) or 0) + HAZARD_PAD
         r2 = r * r
@@ -196,13 +265,126 @@ def _room_scale(grid):
     return POS_SCALE, POS_SCALE, 0.0, 0.0
 
 
-def build_obs(state, grid):
+# ---------------- 地形编码：两种模式 ----------------
+
+def _terrain_local(state, grid):
+    """玩家周围 7×7：0=走不了 / 0.5=能走但危险 / 1=能走且安全。"""
+    if grid is None or state.get("player", {}).get("grid_idx") is None:
+        return [0.0] * (GRID_WIN * GRID_WIN)
+    p = state["player"]
+    w, h = grid["w"], grid["h"]
+    gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
+    r = GRID_WIN // 2
+    haz = _hazard_cells(state, grid)
+    out = []
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            cx, cy = gx + dx, gy + dy
+            if not cell_walkable(cx, cy, grid):
+                out.append(0.0)
+            elif cy * w + cx in haz:
+                out.append(0.5)          # 能走，但站上去会掉血
+            else:
+                out.append(1.0)
+    return out
+
+
+def terrain_full(state, grid):
+    """整间房铺到 CANVAS_H×CANVAS_W 画布，返回 (2, H, W) 的 float32。
+
+        ch0 可走   : 1=玩家能站
+        ch1 危险   : 1=能站但会掉血（火堆/火焰等接触伤害实体覆盖到）
+
+    房间贴画布左上角；画布比房间大的部分保持 0（等价于"走不了"）。
+    比 7×7 窗口的代价：失去平移不变性（网络得自己学"墙在哪"），
+    但换来的是整间房可见 —— 实测 7×7 有 84% 的墙/障碍在盲区。
+    """
+    out = np.zeros((TERRAIN_CHANNELS, CANVAS_H, CANVAS_W), dtype=np.float32)
+    if not grid:
+        return out
+    gw, gh = int(grid["w"]), int(grid["h"])
+    cells = grid.get("cells")
+    if not cells:
+        return out
+    need = gw * gh
+    arr = np.asarray(cells, dtype=np.float32)
+    if arr.size < need:
+        return out
+    walk = arr[:need].reshape(gh, gw)
+
+    h = min(gh, CANVAS_H)
+    w = min(gw, CANVAS_W)
+    out[0, :h, :w] = walk[:h, :w]
+
+    haz = _hazard_cells(state, grid)
+    if haz:
+        hm = np.zeros(need, dtype=np.float32)
+        hm[[i for i in haz if 0 <= i < need]] = 1.0
+        hm = hm.reshape(gh, gw)
+        # 危险只在"能走上去"的格子上有意义，别和墙的信息混在一起
+        out[1, :h, :w] = hm[:h, :w] * walk[:h, :w]
+    return out
+
+
+def _terrain_block(state, grid, terrain_mode):
+    """按模式返回摊平后的地形特征（list）。"""
+    if terrain_mode == TERRAIN_FULL:
+        return terrain_full(state, grid).ravel().tolist()
+    return _terrain_local(state, grid)
+
+
+def line_of_fire(state, grid):
+    """玩家沿 4 个射击方向（上/右/下/左）到第一个挡子弹格子的距离。
+
+    返回长度 4 的 list，值 0~1（格数 / LOS_MAX_CELLS）。
+    索引顺序与射击动作 1=上 2=右 3=下 4=左 一一对应，方便网络直接对照。
+
+    为什么需要：泪弹撞到石头/墙就没了，但地形块只告诉 AI"那一格走不进去"，
+    没有任何一维告诉它"往这个方向射会打在石头上"。实测对局里玩家泪弹
+    大量打在墙上，这些发数全被算成"打空"，命中率被拉低、时间代价被拉高。
+    """
+    blocked = (2, 3, 4)          # 物体 / 实心 / 墙
+    # 没有地形时说"一路畅通"是危险的假信息（会鼓励它乱开枪）。
+    # 反向对齐地形块：grid 缺失时地形块全是 0（哪里都走不了），
+    # 所以视线也给 0（哪里都打不通），两者语义一致。
+    if not grid:
+        return [0.0] * LOS_DIM
+    p = state.get("player", {})
+    gidx = p.get("grid_idx")
+    if gidx is None:
+        return [0.0] * LOS_DIM
+    out = [LOS_MAX_CELLS] * LOS_DIM
+    w, h = grid["w"], grid["h"]
+    coll = grid.get("coll") or []
+    gx, gy = int(gidx) % w, int(gidx) // w
+    span = int(LOS_MAX_CELLS)
+    for k, (dx, dy) in enumerate(LOS_DIRS):
+        dist = LOS_MAX_CELLS
+        for step in range(1, span + 1):
+            cx, cy = gx + dx * step, gy + dy * step
+            if not (0 <= cx < w and 0 <= cy < h):
+                dist = step - 1               # 出界 = 走到房间边缘
+                break
+            i = cy * w + cx
+            c = int(coll[i]) if i < len(coll) else 4
+            if c in blocked:
+                dist = step - 1               # 停在障碍前的最后一格
+                break
+        out[k] = dist
+    return [min(v, LOS_MAX_CELLS) / LOS_MAX_CELLS for v in out]
+
+
+def build_obs(state, grid, terrain_mode=TERRAIN_LOCAL):
     """把一帧状态压成固定长度观测向量。
 
     相比旧版（借鉴 AIsaac observation.rs 的实体特征设计）：
       * 位置按房间真实尺寸归一化（0~1），不再用固定 /500
       * 敌人额外带碰撞体积 size 和碰撞类别 coll（判断接触威胁）
       * 子弹额外带高度 height（抛射/越障弹需要）
+
+    terrain_mode:
+      * TERRAIN_LOCAL（默认，445 维）：地形只看玩家周围 7×7
+      * TERRAIN_FULL （1292 维）：地形铺满整间房（28×16 画布 × 可走/危险 2 通道）
     """
     obs = []
     p = state["player"]
@@ -259,23 +441,10 @@ def build_obs(state, grid):
         else:
             obs.extend([0.0] * 5)
 
-    # 玩家周围 7x7 网格：0=走不了 / 0.5=能走但危险(火堆等) / 1=能走且安全
-    if grid is not None and p.get("grid_idx") is not None:
-        w, h = grid["w"], grid["h"]
-        gx, gy = p["grid_idx"] % w, p["grid_idx"] // w
-        r = GRID_WIN // 2
-        haz = _hazard_cells(state, grid)
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                cx, cy = gx + dx, gy + dy
-                if not cell_walkable(cx, cy, grid):
-                    obs.append(0.0)
-                elif cy * w + cx in haz:
-                    obs.append(0.5)      # 能走，但站上去会掉血
-                else:
-                    obs.append(1.0)
-    else:
-        obs.extend([0.0] * (GRID_WIN * GRID_WIN))
+    # 地形：local=玩家周围 7×7（0/0.5/1），full=整间房 28×16×2 通道
+    obs.extend(_terrain_block(state, grid, terrain_mode))
+    # 视线：4 个射击方向到障碍物的距离（解决"子弹打在墙上"）
+    obs.extend(line_of_fire(state, grid))
 
     # 房间
     obs.append(_clip(state["room"]["enemies_alive"] / 20.0))

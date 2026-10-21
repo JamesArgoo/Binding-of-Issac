@@ -9,9 +9,14 @@ local json = require("json")
 local HOST = "127.0.0.1"
 local BASE_PORT = 48532
 local MAX_INSTANCES = 16   -- 多开：端口 48532..48547，各实例自己找空闲端口连
-local SEND_EVERY = 2  -- 每 2 帧发一次（RL 决策约 30Hz，够了，减少带宽）
+-- 每帧都发：游戏实际只有 ~30fps，SEND_EVERY=2 就等于把决策频率砍到 15Hz。
+-- 配合 train_multi.py --frame-skip 1，每秒步数直接翻倍。
+local SEND_EVERY = 1
 local MAP_EVERY = 30
 local GRID_EVERY = 15  -- 每 15 帧刷新一次地形（实时反映炸开石头/便便后的变化）
+-- 特效（type=1000）纯视觉、Python 一个字段都不用，实测占实体数 61%、JSON 44%。
+-- 发之前直接丢掉：既省 Lua 的 json 编码时间，也省带宽。
+local SKIP_EFFECT = true
 
 local sock = nil
 local frame = 0
@@ -29,6 +34,7 @@ local AUTO_RESTART = true   -- 死亡后自动重开。必须在"刚死"的瞬�
 local AUTO_START_EVERY = 60 -- 死着就每秒重试一次重开
 local was_dead = false
 local last_restart_frame = -999
+local last_cost_ms = 0     -- 上一帧 build_state+json.encode 的耗时（毫秒），随帧上报
 
 -- 无人值守：新开的实例停在主菜单时，自己尝试把对局开起来
 local AUTO_START = true
@@ -127,33 +133,40 @@ local function poll_commands()
     sock:settimeout(0.5)
 end
 
+-- 保留 1 位小数：位置精度 0.1 世界单位（远小于玩家半径 10），
+-- 但 Lua 的 json 编码要把每个数字转成字符串，位数减半就是实打实的省时间。
+local function r1(v)
+    return math.floor(v * 10 + 0.5) / 10
+end
+
 local function build_entities(room)
     local out = {}
     local ents = room:GetEntities()
     for i = 0, ents.Size - 1 do
         local e = ents:Get(i)
         if e and e:Exists() then
-            out[#out + 1] = {
-                id = e.Index,
-                type = e.Type,
-                variant = e.Variant,
-                subtype = e.SubType,
-                x = e.Position.X,
-                y = e.Position.Y,
-                vx = e.Velocity.X,
-                vy = e.Velocity.Y,
-                hp = e.HitPoints,
-                boss = e:IsBoss(),
-                enemy = e:IsEnemy(),
-                dead = e:IsDead(),
-                spawner_type = e.SpawnerType or 0,
-                grid_idx = room:GetGridIndex(e.Position),
-                size = e.Size,               -- 碰撞体积（半径）
-                height = e.Height or 0,      -- 泪弹高度（Z），非泪弹为 0
-                coll = e.CollisionClass or 0,  -- 碰撞类别（EntityCollisionClass）
-                cdmg = e.CollisionDamage or 0, -- 接触伤害（>0 表示站上去会掉血：火堆等）
-                gcoll = e.GridCollisionClass or 0,
-            }
+            local t = e.Type
+            if not (SKIP_EFFECT and t == 1000) then      -- 特效：纯视觉，丢掉
+                out[#out + 1] = {
+                    id = e.Index,
+                    type = t,
+                    variant = e.Variant,
+                    subtype = e.SubType,
+                    x = r1(e.Position.X),
+                    y = r1(e.Position.Y),
+                    vx = r1(e.Velocity.X),
+                    vy = r1(e.Velocity.Y),
+                    hp = e.HitPoints,
+                    boss = e:IsBoss(),
+                    enemy = e:IsEnemy(),
+                    spawner_type = e.SpawnerType or 0,
+                    grid_idx = room:GetGridIndex(e.Position),
+                    size = r1(e.Size),               -- 碰撞体积（半径）
+                    height = r1(e.Height or 0),      -- 泪弹高度（Z），非泪弹为 0
+                    coll = e.CollisionClass or 0,    -- 碰撞类别（EntityCollisionClass）
+                    cdmg = e.CollisionDamage or 0,   -- 接触伤害（>0 表示站上去会掉血）
+                }
+            end
         end
     end
     return out
@@ -196,25 +209,48 @@ local function build_grid(room)
             end
         end
     end)
+    -- GetTopLeftPos/GetBottomRightPos 给的是“可走区域”的边界（已扣掉一圈墙），
+    -- 而网格 w/h 含墙；并且窄房里可走区域并不从第 1 行/列开始（上下各空两行）。
+    -- 所以先用非零碰撞格求出整间房的包围盒，再反推网格原点与格宽，
+    -- 否则玩家世界坐标映射到格子会整体偏移，导航/瞄准全错。
     local tl = room:GetTopLeftPos()
     local br = room:GetBottomRightPos()
+    local minx, miny, maxx, maxy = w, h, -1, -1
+    for i = 0, n - 1 do
+        if coll[i + 1] ~= 0 then
+            local gx, gy = i % w, math.floor(i / w)
+            if gx < minx then minx = gx end
+            if gx > maxx then maxx = gx end
+            if gy < miny then miny = gy end
+            if gy > maxy then maxy = gy end
+        end
+    end
+    local cols = maxx - minx - 1
+    local rows = maxy - miny - 1
+    local cellx = (cols > 0) and ((br.X - tl.X) / cols) or 40.0
+    local celly = (rows > 0) and ((br.Y - tl.Y) / rows) or 40.0
+    if not (cellx > 1.0) then cellx = 40.0 end
+    if not (celly > 1.0) then celly = 40.0 end
     return {
         w = w,
         h = h,
         cells = cells,
         coll = coll,
         ent = ent,
-        ox = tl.X,
-        oy = tl.Y,
-        tw = (br.X - tl.X) / w,
-        th = (br.Y - tl.Y) / h,
+        gv = 3,
+        ox = tl.X - (minx + 1) * cellx,
+        oy = tl.Y - (miny + 1) * celly,
+        tw = cellx,
+        th = celly,
     }
 end
 
 local function build_doors(room)
-    -- 导出 4 个正方向的门：格子索引 + 是否打开
+    -- 导出所有方向的门。大房间（2x2）每边可能有两扇门，DoorSlot 是 0..7：
+    -- 0/1/2/3 = 左/上/右/下，4/5/6/7 = 左/上/右/下的第二扇。
+    -- 只导 0..3 会让 AI 在大房间里看不到真正的出口，清房后原地发呆。
     local out = {}
-    for slot = 0, 3 do
+    for slot = 0, 7 do
         local door = room:GetDoor(slot)
         if door then
             out[#out + 1] = {
@@ -238,10 +274,10 @@ local function build_state()
     local state = {
         frame = game:GetFrameCount(),
         player = {
-            x = player.Position.X,
-            y = player.Position.Y,
-            vx = player.Velocity.X,
-            vy = player.Velocity.Y,
+            x = r1(player.Position.X),
+            y = r1(player.Position.Y),
+            vx = r1(player.Velocity.X),
+            vy = r1(player.Velocity.Y),
             hp = player:GetHearts(),
             max_hp = player:GetMaxHearts(),
             soul_hp = player:GetSoulHearts(),
@@ -338,6 +374,7 @@ function mod:onUpdate()
         sock_send(json.encode({ hello = true, frame = frame, port = cur_port }) .. "\n")
     end
 
+    local t0 = os.clock()
     local ok, result = pcall(build_state)
     if not ok then
         sock_send('{"error":' .. json.encode(tostring(result)) .. '}\n')
@@ -359,7 +396,13 @@ function mod:onUpdate()
         return
     end
 
-    sock_send(json.encode(result) .. "\n")
+    -- 把"上一帧模组自身耗时(ms)"一并带上：如果它接近帧预算(33ms@30fps)，
+    -- 说明是模组在拖慢游戏，先优化模组而不是加机器。
+    -- 用 3 位小数：模组通常只有 0.0x ms，1 位小数会被四舍五入成 0。
+    result.mod_ms = math.floor(last_cost_ms * 1000 + 0.5) / 1000
+    local payload = json.encode(result) .. "\n"
+    last_cost_ms = (os.clock() - t0) * 1000
+    sock_send(payload)
 end
 
 mod:AddCallback(ModCallbacks.MC_POST_UPDATE, mod.onUpdate)

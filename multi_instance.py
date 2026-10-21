@@ -58,6 +58,22 @@ VK_MAP = {
 }
 
 
+def press_enter(hwnd, vk=0x0D):
+    """给指定窗口投递一次 Enter。
+
+    用途：模组的 onUpdate 在主菜单不触发，游戏不会自己进对局，
+    所以要从外部按键把它推进去（实测有效，可全自动开局）。
+    """
+    if not hwnd:
+        return False
+    scan = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+    user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 1 | (scan << 16))
+    time.sleep(0.04)
+    user32.PostMessageW(hwnd, WM_KEYUP, vk,
+                        1 | (scan << 16) | (1 << 30) | (1 << 31))
+    return True
+
+
 def list_windows():
     """返回 [(hwnd, pid, class_name, title), ...]，只保留可见窗口。"""
     out = []
@@ -137,6 +153,7 @@ class Win32KeyController:
         self._move = set()
         self._shoot = set()
         self._down = set()      # 记录已经按下的键，避免重复发 keydown
+        self._last_refresh = 0.0
 
     def _post(self, key, down):
         vk, extended = VK_MAP[key]
@@ -185,6 +202,21 @@ class Win32KeyController:
         self._move.clear()
         self._shoot.clear()
 
+    def refresh(self, every=0.35):
+        """周期性补发 keydown。
+
+        换房/过场那一帧投递的 keydown 可能被游戏丢掉；而 _apply 只在
+        状态切换时发一次，之后就会一直"以为按着"，实际游戏里是松开的。
+        实测表现为 AI 站在空地上一动不动。重复 keydown 等价于键盘自动
+        重复，没有副作用。
+        """
+        now = time.time()
+        if now - self._last_refresh < every:
+            return
+        self._last_refresh = now
+        for k in self._move | self._shoot:
+            self._post(k, True)
+
 
 # ---------------- 多端口桥接 ----------------
 class PortChannel:
@@ -196,11 +228,29 @@ class PortChannel:
         self.connected = False
         self._lock = threading.Lock()
         self._conn = None
+        # 条件变量：模组推来新状态时唤醒等待的 env 线程。
+        # 用它替代忙轮询 —— 忙轮询会抢光 GIL（实测把吞吐从 52 打到 16）。
+        self._cond = threading.Condition()
+        self._seq = 0
 
     def set(self, msg):
         with self._lock:
             self.latest = msg
             self.connected = True
+        with self._cond:
+            self._seq += 1
+            self._cond.notify_all()
+
+    def seq(self):
+        with self._cond:
+            return self._seq
+
+    def wait_new(self, after, timeout=0.1):
+        """阻塞到"有比 after 更新的状态到达"，最多等 timeout。返回当前 seq。"""
+        with self._cond:
+            if self._seq <= after:
+                self._cond.wait(timeout)
+            return self._seq
 
     def state(self):
         with self._lock:
@@ -373,7 +423,8 @@ class InstanceManager:
 
     def __init__(self, n=1, base_port=48532, exe=DEFAULT_EXE,
                  max_instances=16, launch_timeout=120.0,
-                 extra_args=("--luadebug",)):
+                 extra_args=("--luadebug",), injector=None, dll=None,
+                 env_extra=None, viewer_count=0):
         if n < 1 or n > max_instances:
             raise ValueError(f"n 必须在 1..{max_instances} 之间")
         self.n = n
@@ -381,6 +432,12 @@ class InstanceManager:
         self.launch_timeout = launch_timeout
         # 绕过 Steam 直接启动 exe 时必须自己带 --luadebug，否则模组里的 socket 用不了
         self.extra_args = list(extra_args)
+        # 给了 injector+dll 就用"挂起启动 + 注入"来起进程（turbo 加速层）
+        self.injector = injector
+        self.dll = dll
+        self.env_extra = dict(env_extra or {})
+        # 最后 viewer_count 个实例不开 turbo：正常速度 + 正常渲染，供人实时观看
+        self.viewer_count = max(0, int(viewer_count))
         self.bridge = MultiPortBridge(base_port, max_instances)
         self.instances = []
         self._started = False
@@ -394,10 +451,28 @@ class InstanceManager:
 
         for k in range(self.n):
             before = {w[0] for w in isaac_windows()}
+            use_turbo = (self.injector and self.dll
+                         and k < self.n - self.viewer_count)
             if verbose:
-                print(f"[{k + 1}/{self.n}] 启动实例 ...")
-            proc = subprocess.Popen([self.exe] + self.extra_args,
-                                    cwd=os.path.dirname(self.exe))
+                kind = "turbo(不渲染)" if use_turbo else "正常渲染(观看用)"
+                print(f"[{k + 1}/{self.n}] 启动实例 {kind} ...")
+            # Steam 伪装：不设这几个变量，游戏会调 RestartAppIfNecessary 自己退出
+            env = os.environ.copy()
+            env.setdefault("SteamAppId", "250900")
+            env.setdefault("SteamGameId", "250900")
+            env.setdefault("SteamClientLaunch", "1")
+            if self.injector and self.dll:
+                env.update(self.env_extra)
+                if not use_turbo:
+                    env["ISAAC_TURBO_SPEED"] = "1"
+                    env["ISAAC_TURBO_SKIP_PRESENT"] = "0"
+                proc = subprocess.Popen(
+                    [self.injector, self.dll, self.exe] + self.extra_args,
+                    cwd=os.path.dirname(self.exe), env=env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                proc = subprocess.Popen([self.exe] + self.extra_args,
+                                        cwd=os.path.dirname(self.exe), env=env)
             inst = Instance(k, self.bridge.base_port + k, proc)
             self.instances.append(inst)
 
@@ -440,19 +515,33 @@ class InstanceManager:
         return self.instances
 
     # ---------- 等对局 ----------
-    def wait_connections(self, timeout=900.0, verbose=True):
-        """等所有端口都连上（等价于每个窗口都进了对局）。"""
+    def wait_connections(self, timeout=900.0, verbose=True, auto_start=True):
+        """等所有端口都连上（等价于每个窗口都进了对局）。
+
+        auto_start=True 时，对还没连上的窗口自动发 Enter 帮它开局
+        （模组的 onUpdate 在主菜单不触发，所以只能靠外部按键把游戏推进对局）。
+        """
         ports = [self.bridge.base_port + k for k in range(self.n)]
         t0 = time.time()
         last = 0.0
+        last_press = 0.0
         while time.time() - t0 < timeout:
             done = [p for p in ports if self.bridge.channels[p].state() is not None]
             if len(done) == len(ports):
                 return True
+            # 自动开局：每 2 秒给"还没连上"的实例窗口按一次 Enter
+            if auto_start and time.time() - last_press > 2.0:
+                last_press = time.time()
+                for inst in self.instances:
+                    ch = self.bridge.channels.get(inst.port)
+                    if ch is not None and ch.state() is not None:
+                        continue
+                    if inst.hwnd:
+                        press_enter(inst.hwnd)
             if verbose and time.time() - last > 5.0:
                 last = time.time()
                 print(f"  [{time.time() - t0:5.0f}s] 已连上 {len(done)}/{len(ports)}"
-                      f" —— 还没开的窗口请开局")
+                      f"{'（自动按 Enter 推进中）' if auto_start else ''}")
             time.sleep(0.3)
         return False
 
@@ -553,6 +642,12 @@ class ChannelAdapter:
     def send(self, text):
         """下发一行命令给游戏（restart / goto d.12 / exec ...）。"""
         return self.channel.send(text)
+
+    def seq(self):
+        return self.channel.seq()
+
+    def wait_new(self, after, timeout=0.1):
+        return self.channel.wait_new(after, timeout)
 
     def stop(self):
         # 生命周期由 InstanceManager 统一管理，这里不动

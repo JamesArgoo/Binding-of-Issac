@@ -3,9 +3,10 @@
 runs/
 *.npz
 
-# ===== Python 缓存 =====
+# ===== Python 缓存 / 本地环境 =====
 __pycache__/
 *.py[cod]
+.venv/
 
 # ===== 模型权重（体积大，可重新训练/下载）=====
 *.pt
@@ -27,9 +28,32 @@ Thumbs.db
 *.png
 savedatapath.txt
 models/smoke_*
+frames*.json
 
 # ===== 训练产物（体积大，可重训）=====
 models/combat_*.zip
 models/multi_*.zip
+models/bc_*.zip
 models/*_smoke*.zip
 room_catalog_test.json
+
+# ===== turbo 编译产物 =====
+turbo/*.dll
+turbo/*.exe
+turbo/*.log
+turbo/*.png
+turbo_targets.json
+models/*.zip
+
+# 提交消息临时文件
+.commit_msg.txt
+.cm.txt
+.msg2.txt
+.m3.txt
+.m4.txt
+.m5.txt
+.m6.txt
+logs/
+.m9.txt
+.ma.txt
+.mb.txt
