@@ -165,21 +165,35 @@ def run(args):
 
     env = CombatEnv(adapter, inst.controller, variants=variants,
                     frame_skip=args.frame_skip, chunk=1, terrain_mode=terrain,
-                    reset_mode=args.reset_mode, min_hp=args.min_hp)
+                    reset_mode=args.reset_mode, min_hp=args.min_hp,
+                    seed=args.seed)
     rng = np.random.default_rng(args.seed)
 
     model = None
+    models = {}          # --models 多模型轮流评测用
     if args.policy == "model":
         from stable_baselines3 import PPO
         from train_multi import resolve_model_path
-        path = resolve_model_path(args.model)
-        model = PPO.load(path, device="cpu")
         want = obs_dim(terrain)
-        got = int(np.prod(model.observation_space.shape))
-        if got != want:
-            print(f"⚠ 模型观测 {got} 维 ≠ 环境 {want} 维（地形模式 {terrain}）")
-            return 1
-        print(f"载入模型 {path}（{got} 维）")
+        names = ([s.strip() for s in args.models.split(",") if s.strip()]
+                 if args.models else [args.model])
+        for nm in names:
+            path = resolve_model_path(nm)
+            m = PPO.load(path, device="cpu")
+            got = int(np.prod(m.observation_space.shape))
+            if got != want:
+                print(f"⚠ {path} 观测 {got} 维 ≠ 环境 {want} 维（地形模式 {terrain}）")
+                return 1
+            models[nm] = m
+            print(f"载入模型 {nm}（{got} 维）")
+        model = models[names[0]]
+
+    # 多模型时按回合轮转：同一批房间从小到大依次分给不同模型，
+    # 这样"房间难度"这个最大噪声源被平均掉。
+    # 单独跑两个进程各测一个模型是不行的：oracle_eval 每个进程会 attach 到
+    # 不同的游戏实例，各实例的对局状态（道具/层数/属性）早就不同了 ——
+    # 实测同一个模型在两次运行里能测出 41% 和 26% 的命中率。
+    mnames = list(models.keys()) if models else []
 
     rows = []
     gate = {0: [0, 0], 1: [0, 0], 2: [0, 0]}    # 对齐分组: 未开枪 / 同轴 / 不同轴 -> [发数, ]
@@ -200,7 +214,9 @@ def run(args):
                 move, shoot = rule_action(s, env.grid or {}, tear_range=220.0)
             elif args.policy == "model":
                 o = build_obs(s, env.grid, terrain)
-                a, _ = model.predict(o, deterministic=not args.stochastic)
+                cur = mnames[ep % len(mnames)] if mnames else None
+                use = models[cur] if cur else model
+                a, _ = use.predict(o, deterministic=not args.stochastic)
                 move, shoot = int(a[0]), int(a[1])
             else:
                 move, shoot = int(rng.integers(N_MOVE)), int(rng.integers(N_SHOOT))
@@ -295,8 +311,11 @@ def run(args):
         rate = min(1.0, hits / fired) if fired > 0 else 0.0
         rows.append(dict(ep=ep + 1, steps=steps, dealt=dmg, fired=fired,
                          hits=hits, rate=rate, hurt=hurt,
+                         who=(mnames[ep % len(mnames)] if mnames else args.policy),
                          clear=bool(info.get("clear")), dead=bool(info.get("dead"))))
-        print(f"  回合 {ep+1:2d}: {steps:4d} 步  伤害 {dmg:6.1f}  发弹 {fired:4.0f}"
+        print(f"  回合 {ep+1:2d}"
+              + (f" [{mnames[ep % len(mnames)].split(chr(92))[-1][:28]}]" if mnames else "")
+              + f": {steps:4d} 步  伤害 {dmg:6.1f}  发弹 {fired:4.0f}"
               f"  命中 {rate*100:5.1f}%  受伤 {hurt:4.1f}"
               f"  {'清房' if info.get('clear') else '——'}"
               f"{'  死亡' if info.get('dead') else ''}")
@@ -322,6 +341,22 @@ def run(args):
     on_axis_frac = on_axis_steps / shots_total if shots_total else 0.0
 
     print("\n" + "=" * 64)
+    if len({r["who"] for r in rows}) > 1:
+        # 多模型：按模型分组给同口径汇总（房间轮转，难度被平均掉）
+        print(f"{'模型':<34}{'回合':>5}{'清房':>7}{'受伤':>7}{'发弹':>7}{'伤害':>7}{'命中率':>8}")
+        for nm in mnames:
+            sub = [r for r in rows if r["who"] == nm]
+            if not sub:
+                continue
+            f_ = sum(r["fired"] for r in sub)
+            h_ = sum(r["hits"] for r in sub)
+            print(f"{nm.split(chr(92))[-1][:32]:<34}{len(sub):>5}"
+                  f"{sum(r['clear'] for r in sub)/len(sub)*100:>6.0f}%"
+                  f"{sum(r['hurt'] for r in sub)/len(sub):>7.2f}"
+                  f"{sum(r['fired'] for r in sub)/len(sub):>7.1f}"
+                  f"{sum(r['dealt'] for r in sub)/len(sub):>7.1f}"
+                  f"{(h_/f_*100 if f_ else 0):>7.1f}%")
+        print("=" * 64)
     print(f"策略 {args.policy}   回合 {len(rows)}")
     print(f"  平均步数     {avg('steps'):7.1f}")
     print(f"  清房率       {sum(r['clear'] for r in rows)/len(rows)*100:6.1f}%")
@@ -373,6 +408,10 @@ def main():
     ap = argparse.ArgumentParser(description="测命中率天花板（规则教师）和随机下限")
     ap.add_argument("--policy", default="oracle", choices=["oracle", "random", "model"])
     ap.add_argument("--model", default=None, help="--policy model 时的模型路径（可用 latest）")
+    ap.add_argument("--models", default=None,
+                    help="逗号分隔的多个模型，**同一个进程里按回合轮转评测**。"
+                         "比较模型务必用这个：分两次进程跑会 attach 到不同的游戏实例，"
+                         "各实例的道具/层数早就不同，结论会翻转")
     ap.add_argument("--stochastic", action="store_true", help="模型采样动作而不是取 argmax")
     ap.add_argument("--gate", action="store_true",
                     help="完美门控：只在「提前量预测能命中」的那一步开枪（测命中率天花板）")

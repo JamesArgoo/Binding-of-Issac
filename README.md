@@ -205,6 +205,22 @@ python oracle_eval.py --policy model --model latest             # 当前模型
 python oracle_eval.py --policy oracle --gate --gate-los         # 完美门控＝命中率天花板
 ```
 
+**比较模型时必须用 `--models` 在同一进程里轮转，否则结论会翻转。**
+`oracle_eval` 每个进程 attach 到的**游戏实例不同**，而多个实例跑几小时后
+道具/层数/属性早就分叉了，"命中数 = 伤害 ÷ 单发伤害"这个估算会直接失真
+（实测出现过 111.7% 的命中率）。另外房间是随机挑的，10 个回合方差极大：
+
+```bash
+# ✅ 正确：一个进程里轮流打同一批房间
+python oracle_eval.py --policy model \
+    --models models/best_aim,models/best_combat_r5 \
+    --episodes 30 --seed 7 --max-enemies 1
+
+# ❌ 错误：分两次跑再比
+python oracle_eval.py --policy model --model models/best_aim --episodes 20
+python oracle_eval.py --policy model --model models/best_combat_r5 --episodes 20
+```
+
 实测得到的三个关键数字（换房间/换敌人会变，但量级稳定）：
 
 - 规则教师只有 **9.5~18.9%** 命中率（它不看视线，55 发 0 伤害是常事）
@@ -212,6 +228,23 @@ python oracle_eval.py --policy oracle --gate --gate-los         # 完美门控�
 - 完美门控（只在预测能命中时开枪）**46.8~65%**，而且用 **1/3 的子弹打出同样伤害**
 - 距离 80~120 的命中窗口 57%，120~180 只有 14%，>300 只有 6.7%
   → 这就是 `--d-opt 100` 的依据（默认 150 落在窗口外）
+
+## 现在有两个版本，按需要选
+
+| 模型 | 命中率 | 清房率 | 平均受伤 | 特点 |
+|---|---|---|---|---|
+| `models/best_aim.zip` | **45%**（合并 23 回合） | 62~67% | 1.0~3.3 | **打得准**：11 发打 7 次；沿用第 14 轮"BC 教开火时机"的配方 |
+| `models/best_combat_r5.zip` | 19% | 62~80% | 1.2~1.5 | **稳**：旧基线，贴远处喷，不靠近所以挨打少，但命中率很差 |
+
+```bash
+# 看"打得准"的版本玩
+python play_combat.py --model models/best_aim --max-enemies 1
+# 看"稳"的版本玩
+python play_combat.py --model models/best_combat_r5 --max-enemies 1
+```
+
+命中率提升了 2.4 倍是实测确认的；清房率和受伤在种子之间摇摆，
+主要被"敌人打不到、空喷 55 发 0 伤害"这类病理回合拖累 —— 这是下一步最该修的东西。
 
 ## 打准相关的参数速查
 
