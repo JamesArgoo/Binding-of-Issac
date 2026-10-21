@@ -681,6 +681,10 @@ def main():
         # 那样 PPO 每次迭代的日志表（熵/EV/损失）就完全不打印了。
         model.verbose = 1
         model.learning_rate = args.lr
+        # 只改 model.learning_rate 是**没用**的：SB3 每次更新用 lr_schedule(progress)
+        # 取学习率，而这个调度器在 PPO.load 时就已经按存档里的值建好了。
+        # 实测 --lr 1e-4 跑完整个 100k 步，日志表里的 learning_rate 一直显示 3e-4。
+        model.lr_schedule = lambda _progress: args.lr
         model.ent_coef = args.ent_coef
         if not args.resume:
             model.num_timesteps = 0
