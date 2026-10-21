@@ -522,6 +522,7 @@ def demo_grid(w=DEMO_W, h=DEMO_H):
         "w": w, "h": h,
         "cells": [1 if c in (0, 5) else 0 for c in coll],
         "coll": coll, "ent": ent,
+        "gv": 2,
         "ox": DEMO_OX, "oy": DEMO_OY,
         "tw": CELL, "th": CELL,
     }

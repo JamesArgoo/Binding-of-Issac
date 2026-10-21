@@ -153,6 +153,7 @@ class Win32KeyController:
         self._move = set()
         self._shoot = set()
         self._down = set()      # 记录已经按下的键，避免重复发 keydown
+        self._last_refresh = 0.0
 
     def _post(self, key, down):
         vk, extended = VK_MAP[key]
@@ -200,6 +201,21 @@ class Win32KeyController:
             self._post(k, False)
         self._move.clear()
         self._shoot.clear()
+
+    def refresh(self, every=0.35):
+        """周期性补发 keydown。
+
+        换房/过场那一帧投递的 keydown 可能被游戏丢掉；而 _apply 只在
+        状态切换时发一次，之后就会一直"以为按着"，实际游戏里是松开的。
+        实测表现为 AI 站在空地上一动不动。重复 keydown 等价于键盘自动
+        重复，没有副作用。
+        """
+        now = time.time()
+        if now - self._last_refresh < every:
+            return
+        self._last_refresh = now
+        for k in self._move | self._shoot:
+            self._post(k, True)
 
 
 # ---------------- 多端口桥接 ----------------

@@ -209,25 +209,48 @@ local function build_grid(room)
             end
         end
     end)
+    -- GetTopLeftPos/GetBottomRightPos 给的是“可走区域”的边界（已扣掉一圈墙），
+    -- 而网格 w/h 含墙；并且窄房里可走区域并不从第 1 行/列开始（上下各空两行）。
+    -- 所以先用非零碰撞格求出整间房的包围盒，再反推网格原点与格宽，
+    -- 否则玩家世界坐标映射到格子会整体偏移，导航/瞄准全错。
     local tl = room:GetTopLeftPos()
     local br = room:GetBottomRightPos()
+    local minx, miny, maxx, maxy = w, h, -1, -1
+    for i = 0, n - 1 do
+        if coll[i + 1] ~= 0 then
+            local gx, gy = i % w, math.floor(i / w)
+            if gx < minx then minx = gx end
+            if gx > maxx then maxx = gx end
+            if gy < miny then miny = gy end
+            if gy > maxy then maxy = gy end
+        end
+    end
+    local cols = maxx - minx - 1
+    local rows = maxy - miny - 1
+    local cellx = (cols > 0) and ((br.X - tl.X) / cols) or 40.0
+    local celly = (rows > 0) and ((br.Y - tl.Y) / rows) or 40.0
+    if not (cellx > 1.0) then cellx = 40.0 end
+    if not (celly > 1.0) then celly = 40.0 end
     return {
         w = w,
         h = h,
         cells = cells,
         coll = coll,
         ent = ent,
-        ox = tl.X,
-        oy = tl.Y,
-        tw = (br.X - tl.X) / w,
-        th = (br.Y - tl.Y) / h,
+        gv = 3,
+        ox = tl.X - (minx + 1) * cellx,
+        oy = tl.Y - (miny + 1) * celly,
+        tw = cellx,
+        th = celly,
     }
 end
 
 local function build_doors(room)
-    -- 导出 4 个正方向的门：格子索引 + 是否打开
+    -- 导出所有方向的门。大房间（2x2）每边可能有两扇门，DoorSlot 是 0..7：
+    -- 0/1/2/3 = 左/上/右/下，4/5/6/7 = 左/上/右/下的第二扇。
+    -- 只导 0..3 会让 AI 在大房间里看不到真正的出口，清房后原地发呆。
     local out = {}
-    for slot = 0, 3 do
+    for slot = 0, 7 do
         local door = room:GetDoor(slot)
         if door then
             out[#out + 1] = {
