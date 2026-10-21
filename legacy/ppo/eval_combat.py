@@ -24,7 +24,8 @@ try:
 except Exception:
     pass
 
-import multi_instance as mi
+import _bootstrap  # noqa: F401  （补齐仓库根目录）
+from isaac_ai import multi_instance as mi
 from combat_env import CombatEnv
 from train_multi import load_variants
 

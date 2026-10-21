@@ -16,8 +16,8 @@ import time
 from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
-import multi_instance as mi  # noqa: E402
+import _bootstrap  # noqa: E402,F401  （补齐仓库根目录）
+from isaac_ai import multi_instance as mi  # noqa: E402
 
 EXE = r"D:\SteamLibrary\steamapps\common\The Binding of Isaac Rebirth\isaac-ng.exe"
 INJECTOR = os.path.join(HERE, "turbo_inject.exe")

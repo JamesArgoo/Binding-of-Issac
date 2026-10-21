@@ -1,102 +1,129 @@
-﻿# Binding-of-Issac — 用强化学习打以撒
+# 以撒战术 AI
 
-不截屏识图，直接把游戏内存里的状态经 Lua 模组 + socket 送到 Python，
-用 PPO 学**单房间战斗**，输出按键再注入回游戏。
-
-```
-Isaac(模组 main.lua) --状态/JSON/socket--> Python(观测/奖励) --PPO--> 动作
-        ^                                                          |
-        +---------------- PostMessage 按键注入 <--------------------+
-```
-
-- **模组**：每 2 帧发一帧状态（玩家/敌人/子弹/网格/门/地图），并接收 Python 下发的
-  控制台命令（`restart` / `goto d.<id>`）。需要 Steam 启动项 `--luadebug`。
-- **多开**：N 个实例，端口段 48532~48547 自动分配；用探针把"端口↔窗口"对上号；
-  按键用 `PostMessage` 直接投给目标窗口 —— **不需要窗口焦点**（这是多开的关键）。
-- **训练**：每实例一个 `CombatEnv`，线程并行 step，包成 SB3 的 `VecEnv` 交给 PPO。
-
-## 核心设计（为什么这么做）
-
-**1. 只练单房间战斗，不练走整层楼。**
-reset 时用控制台命令 `restart` + `goto d.<variant>` 把玩家传送进有敌人的房间，
-清房或死亡即结束。照搬 AIsaac 的任务设定 —— 让 AI 自己走整层楼难一个量级
-（实测会在两个已清空房间之间无限来回弹，永远遇不到敌人）。624 个可用房间由
-`room_catalog.py` 探出来。
-
-**2. 观测对房间尺寸不变。**
-位置按房间尺寸归一化；地形只看玩家周围 7×7 局部窗口；敌人/子弹用固定槽位按距离排序。
-所以 15×9 和 26×14 的房间进网络后分布一致。共 **445 维**（含玩家朝向 `fire_dir`/`head_dir`、
-无敌帧、伤害/泪速/移速，以及网格三值编码：0 走不了 / 0.5 能走但危险(火堆) / 1 安全）。
-
-**3. 奖励**
+用 Lua 模组直接读取《以撒的结合：忏悔》的内存状态，Python 决策后把按键注入游戏。
+不截屏、不训练、不加载模型；**当前 AI 只用 Python 标准库**。
 
 ```
-hit    +1 每造成 5 点伤害
-kill   +0.25 每次击杀
-time   -(2.0 + (0.5-2.0)*命中率) 每秒               # 打得准，时间更便宜
-hurt   -凹形血量曲线                                 # 丢最后一颗心比第一颗贵 4 倍
-align  gamma*Phi(s')-Phi(s), Phi = -0.2*|d-150|/40  # 站在刚好能打到的距离
-wall   -0.6/秒 顶着墙/石头/便便推
-clear  +40
-death  -5 - 2.0*min(剩余秒数, 30)                    # 早死不该省时间成本
-整体 x0.1
+游戏（isaac_ai_bridge/main.lua）
+        │  JSON 状态，TCP 48532+
+        ▼
+Python 战术 AI（isaac_ai/）
+        │  PostMessage 按键
+        ▼
+游戏窗口（不需要焦点）
 ```
 
-要点：**不直接惩罚打空**，而是让时间代价随命中率下降；血量用凹形曲线让 AI 残血时更谨慎。
+## 现在能做什么
 
-**4. 动作**：移动 8 方向 + 停，射击 4 方向 + 不射（泪滴只有四个方向）。
+- **战斗**：预测泪弹飞行轨迹，只有“打得中且视线没被挡”才开枪；保持约 4 格交战距离。
+- **走位**：模拟未来 20 帧躲弹幕、躲敌人身体；被多只怪围攻时进入脱离模式，绕开包围圈。
+- **贴墙处理**：路径带开阔度代价，墙角和障碍物旁用局部转向绕行，不在原地左右横跳。
+- **特殊攻击**：识别 Monstro 的 `JumpUp`/`JumpDown` 提前离开落点；估算高抛弹幕的落点。
+- **探索**：清房后先拾取，再按楼层连通图去未访问的房间，不在两个已清房间之间折返。
+- **机关房**：会找压力板、用炸弹炸开石头、撤离时避开 TNT。
+- **整局运行**：死亡自动重开；支持同时接管多个游戏实例。
 
-## 文件
+## 快速开始
 
-| 文件 | 作用 |
-|---|---|
-| `isaac_ai_bridge/main.lua` | 游戏模组：状态上行 + 命令下行 |
-| `isaac_bridge.py` | 状态解析小工具（敌人/敌方子弹/Pickup） |
-| `isaac_env.py` | 观测构建 `build_obs`、网格可走性归一化、危险格 |
-| `combat_env.py` | 单房间战斗环境（奖励 + reset + chunk） |
-| `multi_instance.py` | 多开：PostMessage 控制器、端口桥接、实例管理、端口对号 |
-| `train_multi.py` | 多开并行 PPO 训练 |
-| `room_catalog.py` / `.json` | 探测/记录有敌人的房间（624 个） |
-| `eval_combat.py` / `diag_combat.py` / `test_combat.py` | 评估 / 诊断 / 自检 |
-| `test_multi.py` / `probe.py` | 多开启动验证 / socket 探针 |
-| `ai_basic_4.py` | 规则AI（8方向移动 + 4方向甩枪），备选与对照 |
+### 1. 准备
 
-## 用法
+- Windows + Steam 版《以撒的结合：忏悔》，Python 3.9 以上。
+- Steam 里右键游戏 → 属性 → 启动选项，填 `--luadebug`（socket 通信必需）。
+- 关闭失焦暂停：在 `文档\My Games\Binding of Isaac Repentance\options.ini`
+  里设 `PauseOnFocusLost=0`。否则窗口一失焦，游戏就暂停。
+
+### 2. 安装模组
 
 ```bash
-# 1) 启动 N 个实例（之后在每个游戏窗口手动按 Enter 开一局）
-python test_multi.py --launch 4 --keep
-
-# 2) 训练（--max-enemies 4 = 课程学习，先只练 <=4 敌人的房间）
-python train_multi.py --attach --combat --chunk 1 --max-enemies 4 --steps 200000
-
-# 3) 评估与诊断
-python eval_combat.py --model models/combat_v4.zip --episodes 10
-python diag_combat.py --model models/combat_v4.zip --episodes 6
+python install_mod.py
 ```
 
-## 已知约束（踩过的坑，别踩第二遍）
+脚本会自动找游戏目录；找不到时用 `--game "D:\...\The Binding of Isaac Rebirth"` 指定。
+安装后进入游戏，在 Mods 菜单启用 **Isaac AI Bridge**。
 
-- **必须设工作目录**：启动 exe 要 `cwd=游戏目录`，否则找不到 `resources/`，着色器全失败直接崩。
-- **Steam 默认只允许一个实例**：要设 `SteamAppId` / `SteamGameId` / `SteamClientLaunch`
-  伪装成"由 Steam 启动"，绕过 `SteamAPI_RestartAppIfNecessary`。
-- **`PauseOnFocusLost=0`**（`options.ini`）：否则失焦的实例会暂停，多开等于没开。
-- **死亡必须立刻 `restart`**：一旦进入死亡结算画面，`Isaac.ExecuteCommand("restart")` 就失效，
-  玩家会永远卡在 game over。
-- **`goto` 造出来的房间 `room.index` 恒为 -3**，不能用"房间号变了"判断传送是否成功，
-  要看"房间是否已清空"。
-- **不要在游戏写存档时强杀进程**：会把存档重置成 3956 字节的空档
-  （`YYYYMMDD.rep_persistentgamedataN.dat` 是历史备份，可改名恢复）。
+### 3. 让 AI 玩
 
-## 吞吐现状
+```bash
+# 已经开好游戏并进入一局：直接接管
+python play_ai.py --attach
 
-单实例被锁在 60fps 实时，吞吐只能靠多开线性堆：
+# 或者让脚本启动游戏（启动前请关掉已有的 Isaac 窗口）
+python play_ai.py --launch 1
+```
 
-| 配置 | 步/秒 |
+运行后按 `Ctrl+C` 停止。窗口可以放在后台，但**不要最小化**——最小化会让游戏暂停。
+
+### 4. 离线自检（不用开游戏）
+
+```bash
+python tests/test_tactical_agent.py
+```
+
+## 工作原理
+
+1. **状态上行**：`main.lua` 每 2 帧发送一帧状态，包括玩家、敌人、子弹、网格、门、
+   地图和掉落物。Python 同时可以下发 `restart` / `goto` / `spawn` 命令。
+2. **决策**：`tactical_agent.py` 做三件事——解析弹道决定往哪开枪、逐方向模拟 20 帧
+   决定怎么走、用 A* 和楼层图决定去哪。
+3. **按键下行**：Win32 `PostMessage` 把方向键和射击键直接投给游戏窗口。多开时每个
+   实例有自己的端口和窗口句柄，互不干扰。
+
+## 文件地图
+
+| 路径 | 用途 |
 |---|---|
-| 单实例 | ~25-30 |
-| 2 实例 | ~49 |
-| 4 实例 | ~52（含 reset 开销，已接近瓶颈） |
+| `play_ai.py` | 仓库根目录的启动入口，转发到 `isaac_ai/play_ai.py` |
+| `install_mod.py` | 把 `isaac_ai_bridge/` 安装到游戏 mods 目录 |
+| `isaac_ai/tactical_agent.py` | **决策核心**：瞄准、走位、躲弹、A* 导航、探索、机关房 |
+| `isaac_ai/multi_instance.py` | 多开基础设施：窗口查找、端口桥接、按键注入、实例管理 |
+| `isaac_ai/play_ai.py` | 主循环：收状态 → 决策 → 发按键 → 死亡重开 |
+| `isaac_ai/__init__.py` | 包说明，无逻辑 |
+| `isaac_ai_bridge/main.lua` | 游戏模组：状态上行 + 控制命令下行 |
+| `isaac_ai_bridge/metadata.xml` | 模组元数据 |
+| `tests/test_tactical_agent.py` | 离线回归测试，覆盖瞄准、躲弹、导航、机关房等 32 项 |
+| `tools/diag_live.py` | 诊断：状态、网格映射、按键是否生效 |
+| `tools/diag_explore.py` | 诊断：清房后的选门和楼层连通图 |
+| `tools/diag_air.py` | 诊断：跳跃 BOSS / 高抛弹幕的高度数据 |
+| `tools/diag_monstro_live.py` | 诊断：生成 Monstro，观察跳跃躲避 |
+| `tools/diag_spawn.py` | 诊断：生成指定实体并采样动画/高度 |
+| `tools/probe.py` | 探针：看模组有没有连上端口 |
+| `tools/test_multi.py` | 多开验证：端口↔窗口映射、无焦点按键 |
+| `room_catalog.json` | 旧 PPO 用的房间目录，当前 AI 不需要 |
+| `legacy/ppo/` | 归档的旧 PPO 训练/评估代码，不维护 |
+| `docs/EXPERIMENTS.md` | 旧 PPO 实验记录 |
 
-`--chunk > 1`（ACT 式动作分块）实测**负收益**：动作空间从 2 维扩到 8 维，
-熵卡在上限（15.2）不下降，且慢 4 倍。默认 `chunk=1`。
+## 常用命令
+
+| 目的 | 命令 |
+|---|---|
+| 接管当前游戏 | `python play_ai.py --attach` |
+| 启动并自动开局 | `python play_ai.py --launch 1` |
+| 跑 2 分钟自动停 | `python play_ai.py --attach --duration 120` |
+| 同时跑 2 个实例 | `python play_ai.py --launch 2` |
+| 接管所有已开窗口 | `python play_ai.py --attach-all` |
+| 记录状态日志 | `python play_ai.py --attach --log logs/run.jsonl` |
+| 检查模组版本是否一致 | `python install_mod.py --check` |
+| 离线测试 | `python tests/test_tactical_agent.py` |
+| 多开环境验证 | `python tools/test_multi.py --launch 2 --keep` |
+
+新启动的实例如果停在主菜单，脚本会自动按 Enter；也可以在窗口里手动按 Enter。
+
+## 验证情况
+
+- 离线回归：`32/32 通过`。
+- 已实机确认：Monstro 跳跃躲避不掉血；清房后能连续进入未访问房间；多怪近身会触发脱离。
+- 已离线覆盖、实机尚未专门复现：墙角/障碍物绕行、机关房炸路与压力板、高抛弹幕。
+
+## 已知限制
+
+- **不要最小化游戏窗口**：Isaac 最小化后会暂停 `onUpdate`，模组不再发状态。
+- **一个端口只能有一个客户端**：跑 `--launch` 前先关掉已有窗口，否则状态和按键会串台。
+- **死亡要立刻重开**：进入死亡结算后 `restart` 会失效，主循环会自动补发。
+- **不要在建档写入时强杀进程**：可能把存档写成空档。正常停止请用 `Ctrl+C`。
+- **必须用 `--luadebug` 启动**：直接双击 exe 时模组无法建立 socket。
+- 当前策略是确定性的规则/搜索 AI，不会从对局中学习；调整行为改 `Config` 里的权重。
+
+## 旧 PPO 实验
+
+`legacy/ppo/` 是早期强化学习路线的存档，需要 `requirements.txt` 里的
+torch/SB3 等依赖，当前 AI 不使用，也不再维护。相关背景见 `docs/EXPERIMENTS.md`。

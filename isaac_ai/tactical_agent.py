@@ -1,25 +1,19 @@
 # -*- coding: utf-8 -*-
-"""tactical_agent.py —— 可实机运行的战术 AI（不依赖 PPO）
+"""tactical_agent.py —— 战术 AI 的决策核心。
 
-为什么要这个文件
-----------------
-项目原来的 PPO 模型在真实对局里命中率 ~20%、清房率 ~65%，而且动作会在
-"敢开枪 <> 不敢开枪"两个模式之间漂移。继续调奖励权重的收益已经很低。
-这里换一条路：直接把"瞄得准、会躲、会走位"写成可解释的搜索策略。
+给定一帧游戏状态，返回这一帧该按的方向键和射击键。决策分三层：
 
-它和 RL 模型使用同一份内存状态（模组 uplink），但决策由三块组成：
-
-1. **弹道求解**（aim）：对 4 个射击方向，解析计算"泪弹飞出去后与敌人的
-   最近距离"，把玩家当前速度对泪弹的继承也算进去；只有预测能命中、且
+1. **弹道求解**（aim）：对 4 个射击方向，解析计算“泪弹飞出去后与敌人的
+   最近距离”，把玩家当前速度对泪弹的继承也算进去；只有预测能命中、且
    中间没有石头/墙时才开火。
 2. **威胁搜索**（move）：把 8 个移动方向 + 停止逐一向前模拟 20 帧，
    同时躲避敌方弹幕、敌人身体、火堆/尖刺和墙角；安全优先，其次才是
-   保持交战距离、对齐射击轴、取得视线。
+   保持交战距离、对齐射击轴、取得视线。多怪围堵时切换到脱离模式。
 3. **导航**（navigate）：清房后用 A* 走到掉落物/门；用楼层地图 BFS 找
-   最近的未探索房间，避免在两个清空的房间之间来回弹。
+   最近的未探索房间。
 
-这个模块只负责"给定一帧状态，返回按键"，不碰 socket / 窗口。这样可以在
-离线测试里构造假局面验证瞄准和躲弹逻辑。
+跳跃 BOSS、高抛弹幕、机关房炸弹和探索选门等特殊行为也在本文件里。
+模块只做决策，不碰 socket / 窗口，方便在离线测试里构造假局面。
 """
 from __future__ import annotations
 
@@ -380,10 +374,11 @@ class Action:
 @dataclass
 class Config:
     # 交战距离：太近容易被贴脸，太远泪弹要飞太久且容易脱靶。
-    # 旧值 108 在实机里会一路顶到敌人身上（用户反馈"走到怪脸上"）。
-    d_opt: float = 132.0
-    d_min: float = 84.0
-    d_far: float = 235.0
+    # 实机反馈仍然是"贴脸"：d_opt 132 在 40px 一格的地图里只有 3 格多，
+    # BOSS 一个冲刺就压到身上。拉开到 4 格左右，同时用全敌人软威胁兜底。
+    d_opt: float = 164.0
+    d_min: float = 108.0
+    d_far: float = 280.0
     horizon: int = 20
     speed_default: float = 3.6
     player_radius: float = 10.0
@@ -392,20 +387,32 @@ class Config:
     aim_slack: float = 0.95
     dodge_margin: float = 7.0
     body_margin: float = 5.0
-    wall_radius: float = 8.0
+    wall_radius: float = 10.0
     # 评分权重
     w_danger: float = 3.0
     w_body: float = 2.0
-    w_distance: float = 1.25
+    w_distance: float = 1.1
     w_align: float = 1.25
     w_los: float = 0.85
-    w_open: float = 0.28
+    w_open: float = 0.70
     stop_bonus: float = 0.32
     w_aim: float = 1.15          # 移动方向带来的射击机会（含速度补偿）
-    # 近身软威胁：不必等身体重叠，进入这个缓冲就往后撤
-    personal_space: float = 26.0
-    space_penalty: float = 2.2
-    retreat_bonus: float = 0.55
+    # 近身软威胁：不必等身体重叠，进入这个缓冲就往后撤。
+    # 旧值 26 只比碰撞半径多一点点，非目标怪几乎不扣分，实机里会被侧面的
+    # 小怪/苍蝇一路贴到身上。这里改成对所有敌人共用的"个人空间"。
+    personal_space: float = 48.0
+    space_penalty: float = 3.1
+    retreat_bonus: float = 0.65
+    # 多敌人：进入这个半径的怪都参与包围/贴身评分
+    crowd_radius: float = 190.0
+    crowd_penalty: float = 1.5
+    encircle_penalty: float = 40.0
+    escape_radius: float = 170.0
+    # 墙边：路径全程低于这个开阔度就扣分；低于 wall_radius 视为贴墙
+    wall_soft: float = 40.0
+    wall_penalty: float = 3.0
+    # 墙角陷阱：离墙近、且怪也近时，往墙/角里滑的代价要明显高于绕开。
+    corner_penalty: float = 7.0
     # 切换目标的滞回
     target_hysteresis: float = 0.35
     # 机关房炸弹：每隔多久才允许再放一颗（30Hz 决策帧）
@@ -430,11 +437,13 @@ class TacticalAgent:
         self.stuck_frames = 0
         self.recover_frames = 0
         self.recover_dir = (0, 0)
+        self.recover_goal: Optional[int] = None
         self.no_los_frames = 0
         self.no_aim_frames = 0
         self.path: list[int] = []
         self.path_goal: Optional[int] = None
         self.path_kind: str = ""
+        self.path_cost_ver = 0
         self.pickup_blacklist: set[int] = set()
         self.pickup_wait = 0
         self.door_push = 0
@@ -468,6 +477,13 @@ class TacticalAgent:
         self._jump_warn: dict[int, dict] = {}
         self._last_state_frame: Optional[float] = None
         self._tick = 0
+        # 多敌人脱离：缓存撤离目标格，避免 30Hz 每帧重跑 A*
+        self._escape_goal: Optional[int] = None
+        self._escape_age = 0
+        self._escape_cost: Optional[list[float]] = None
+        self._escape_ver = 0
+        # 最近一次 plan_move 的逐方向评分（实机排查"贴墙变蠢"用，不参与决策）
+        self.last_dir_scores: dict = {}
 
     # ------------------------------------------------------------------
     # 状态更新
@@ -501,6 +517,7 @@ class TacticalAgent:
             self.door_pushing = None
             self.stuck_frames = 0
             self.recover_frames = 0
+            self.recover_goal = None
             self.no_los_frames = 0
             self.no_aim_frames = 0
             self.bomb_wait = 0
@@ -515,6 +532,9 @@ class TacticalAgent:
             self._air_prev.clear()
             self._air_land.clear()
             self._jump_warn.clear()
+            self._escape_goal = None
+            self._escape_age = 0
+            self._escape_cost = None
         self.room_index = idx
         if idx is not None:
             self.visited_rooms.add(idx)
@@ -564,6 +584,7 @@ class TacticalAgent:
         self.prev_pos = None
         self.stuck_frames = 0
         self.recover_frames = 0
+        self.recover_goal = None
         self.no_los_frames = 0
         self.no_aim_frames = 0
         self.path = []
@@ -582,6 +603,9 @@ class TacticalAgent:
         self._air_prev.clear()
         self._air_land.clear()
         self._jump_warn.clear()
+        self._escape_goal = None
+        self._escape_age = 0
+        self._escape_cost = None
         self.bomb_blacklist.clear()
         self.plate_wait = 0
 
@@ -917,20 +941,43 @@ class TacticalAgent:
                 danger += (rr - d + 2.0) * 5.0 * urgency
                 if d < rr * 0.55:
                     danger += 45.0 * urgency
+        near_pts: list[tuple[float, float]] = []
         for e in enemies:
             if e.cdmg <= 0 and not e.boss:
                 continue
             ex, ey = e.x + e.vx * t, e.y + e.vy * t
             rr = self._body_radius(e)
-            d = math.hypot(ex - x, ey - y)
+            d = max(1.0, math.hypot(ex - x, ey - y))
             if d < rr:
                 danger += (rr - d + 2.0) * 3.5 * urgency
+            # 真正贴脸/即将重叠：比软威胁更硬，任何情况下都不该站进去
+            hard = e.size + self.cfg.player_radius + 18.0
+            if d < hard:
+                danger += (hard - d + 2.0) * 9.0 * urgency
             # 贴身软威胁：身体还没碰上，但已经进入"再走两步就撞"的缓冲。
             # 只靠 rr 时，AI 会一路追到几乎重叠才觉得危险 —— 实机看起来就像
-            # 往怪脸上走。这个场让它在 d_min 附近就主动保持距离。
+            # 往怪脸上走。这个场对所有敌人生效，不只当前目标。
             soft = e.size + self.cfg.player_radius + self.cfg.personal_space
             if d < soft:
                 danger += (soft - d + 2.0) * self.cfg.space_penalty * urgency
+                # 朝我冲的怪比原地站着的更危险，给接近速度加权
+                vrad = ((x - ex) * e.vx + (y - ey) * e.vy) / d
+                if vrad > 0.0:
+                    danger += (min(1.2, vrad / 3.0) * 26.0 * urgency
+                               * (1.0 - d / soft))
+            if d < self.cfg.crowd_radius:
+                near_pts.append((ex, ey))
+        # 包围检测：附近怪的方向向量和。所有怪都在一侧时值大，被夹在中间时
+        # 接近 0。实机里被两三种怪从两侧追，单纯"躲最近那只"会撞进另一只。
+        if len(near_pts) >= 2:
+            sx = sy = 0.0
+            for ex, ey in near_pts:
+                dd = max(1.0, math.hypot(ex - x, ey - y))
+                sx += (x - ex) / dd
+                sy += (y - ey) / dd
+            crowd_align = math.hypot(sx, sy) / len(near_pts)
+            danger += (1.0 - crowd_align) * self.cfg.encircle_penalty * urgency
+            danger += max(0, len(near_pts) - 1) * 6.0 * urgency
         # 跳跃 BOSS：预警圈画在落点上，AI 在起跳蓄力时就开始横移
         for j in self._jump_warn.values():
             rr = j["radius"]
@@ -971,23 +1018,34 @@ class TacticalAgent:
         obs_times = [t for t in obs_times if t <= H] or [H]
         # 预计算每个时间点的目标位置
         best_dir, best_score, best_detail = (0, 0), -1e18, {}
+        best_clear_dir, best_clear_score, best_clear_detail = None, -1e18, {}
         clearance = grid.clearance()
         vpx = float(p.get("vx", 0) or 0.0)
         vpy = float(p.get("vy", 0) or 0.0)
         cur_d = (math.hypot(target.x - px, target.y - py)
                  if target is not None else 0.0)
+        cur_nearest = min((math.hypot(e.x - px, e.y - py) for e in enemies),
+                          default=1e9)
+        cur_idx = grid.idx_of(px, py)
+        cur_cl = clearance[cur_idx] if cur_idx >= 0 else 0.0
+        self.last_dir_scores = {}
         for mx, my in DIRS8 + [(0, 0)]:
             ux, uy = _dir8_to_vec(mx, my)
             score = 0.0
             danger_sum = 0.0
             sampled = 0
             blocked_at = None
+            min_cl = 1e9
             for t in obs_times:
                 sx = px + ux * speed * t
                 sy = py + uy * speed * t
-                if grid.idx_of(sx, sy) < 0 or not grid.point_clear(sx, sy, self.cfg.wall_radius):
+                idx_t = grid.idx_of(sx, sy)
+                if idx_t < 0 or not grid.point_clear(sx, sy, self.cfg.wall_radius):
                     blocked_at = t
                     break
+                # 整条路径都要留出空间，不能只看最后一帧：贴着墙走时最后
+                # 一格可能很开阔，但中途已经擦着石头拐角了。
+                min_cl = min(min_cl, clearance[idx_t])
                 danger_sum += self._danger_at(sx, sy, t, projectiles, enemies,
                                               hazards, grid, urgent)
                 sampled += 1
@@ -996,12 +1054,19 @@ class TacticalAgent:
             # 撞墙不是伤害：按住这个方向只会在墙前停下。只有"一动就撞"才说明
             # 这个方向没用。旧版对 18 帧内任何时刻撞墙都扣 -900，结果靠墙时
             # 几乎所有方向都被淘汰，AI 只剩站桩可选（实测靠下墙时完全不动）。
-            if blocked_at is not None and blocked_at <= 2:
+            immediate_block = blocked_at is not None and blocked_at <= 2
+            if immediate_block:
                 # 正对墙的方向几乎没有位移，不能因为“远离 BOSS”的评分被选中。
                 # 实机踩过：被 BOSS 逼到墙角时还一直往墙里推，结果贴脸挨打。
-                score -= 4.0 if blocked_at <= 1 else 2.6
+                # 危险项动辄上百分，这里必须足以抵消"远离怪"的收益，否则
+                # 评分仍会选一个顶墙方向。
+                score -= 26.0 if blocked_at <= 1 else 16.0
             elif blocked_at is not None and blocked_at <= 4:
-                score -= 0.6
+                # 两三帧后就撞墙：实机表现就是走到墙边原地蹭。重罚，优先
+                # 选能持续走一段的方向，而不是为了远离怪一头顶进墙里。
+                score -= 9.0
+            elif blocked_at is not None and blocked_at <= 6:
+                score -= 3.5
             # 评估点：能走多远就评多远，绝不用墙里的位置去算对齐/开阔度
             mid_t = obs_times[len(obs_times) // 2]
             eval_t = mid_t if blocked_at is None else min(mid_t, max(1, blocked_at - 1))
@@ -1062,35 +1127,107 @@ class TacticalAgent:
                             score += 0.08
                 elif (mx, my) == (0, 0):
                     score -= 0.28
-            # 开阔度：别贴着墙角/石头（用能走到的评估点，不是墙里的点）
-            idx = grid.idx_of(mxp, myp)
-            if idx >= 0:
-                cl = clearance[idx]
-                score += self.cfg.w_open * min(cl, 90.0) / 90.0
+            # ---- 所有敌人的安全距离（不只当前目标）----
+            # 目标距离项只约束选中的那只怪；侧面/背后的怪由这里统一拉开。
+            # 实机被两三种怪追时，只盯目标会让 AI 主动撞进旁边那只身上。
+            eval_near = 1e9
+            crowd_pts = []
+            for e in enemies:
+                if e.cdmg <= 0 and not e.boss:
+                    continue
+                ex = e.x + e.vx * eval_t
+                ey = e.y + e.vy * eval_t
+                dd = math.hypot(ex - mxp, ey - myp)
+                eval_near = min(eval_near, dd)
+                if dd < self.cfg.crowd_radius:
+                    crowd_pts.append((ex, ey))
+                safe = self.cfg.d_min + min(24.0, e.size * 0.5)
+                if dd < safe:
+                    gap = (safe - dd) / safe
+                    score -= self.cfg.crowd_penalty * (gap ** 1.3) * 7.0
+            if eval_near < 1e8 and cur_nearest < self.cfg.d_min + 20.0:
+                # 已经在危险距离内：明确奖励把最近距离拉开的移动
+                score += 0.6 * min(1.0, max(0.0, eval_near - cur_nearest) / 50.0)
+            if len(crowd_pts) >= 2:
+                # 让附近怪尽量集中在同一侧，别走进两面包夹的中间
+                sx = sy = 0.0
+                for ex, ey in crowd_pts:
+                    dd = max(1.0, math.hypot(ex - mxp, ey - myp))
+                    sx += (mxp - ex) / dd
+                    sy += (myp - ey) / dd
+                align = math.hypot(sx, sy) / len(crowd_pts)
+                score += (align - 0.5) * self.cfg.crowd_penalty * 2.0
+            # 开阔度：用整条路径的最小值，而不是最后一格。贴着石头拐角走时
+            # 最后一点可能是开阔的，中途已经擦墙了，实机表现就是"贴墙变蠢"。
+            if min_cl < 1e8:
+                open_norm = min(min_cl, 90.0) / 90.0
+                score += self.cfg.w_open * open_norm
                 # 近身时更看重“有地方退”：墙角只有两个方向可走，
                 # 被快速 BOSS 贴上来就无路可逃。开阔度权重临时加倍。
-                if target is not None and cur_d < self.cfg.d_min * 1.25:
-                    score += 0.85 * min(cl, 90.0) / 90.0
-                if cl < self.cfg.wall_radius + 4:
-                    score -= 0.55
+                if target is not None and cur_nearest < self.cfg.d_min * 1.35:
+                    score += 0.9 * open_norm
+                if min_cl < self.cfg.wall_soft:
+                    score -= self.cfg.wall_penalty * (
+                        (self.cfg.wall_soft - min_cl) / self.cfg.wall_soft)
+                    # 怪已经近了还沿墙/钻角走，等于把自己关进死角。平方项
+                    # 让"擦墙"和"贴墙"拉开差距；墙角脱困交给 crowd_escape。
+                    if cur_nearest < self.cfg.d_min + 70.0:
+                        score -= self.cfg.corner_penalty * (
+                            (self.cfg.wall_soft - min_cl) / self.cfg.wall_soft) ** 2
+                if min_cl < self.cfg.wall_radius + 4:
+                    score -= 1.2
+            # 墙边梯度：朝开阔度更高的方向给奖励，朝墙/角里走扣分。
+            # 旧版只在"朝墙"时扣 0.7，离墙近时也不足以抵消危险项，
+            # 实机表现就是贴着墙一路滑进角落。
+            idx = grid.idx_of(mxp, myp)
+            if idx >= 0:
+                gw = grid.w
+                if 1 <= idx % gw < gw - 1:
+                    gx = clearance[idx + 1] - clearance[idx - 1]
+                    gy = (clearance[idx + gw] - clearance[idx - gw]
+                          if 0 <= idx - gw and idx + gw < len(clearance) else 0.0)
+                    gn = math.hypot(gx, gy)
+                    if gn > 1e-6:
+                        toward_open = (ux * gx + uy * gy) / gn
+                        score += 0.8 * toward_open
+                        if cur_cl < self.cfg.wall_soft:
+                            score += 1.6 * toward_open
             # 连续性（轻微，避免 30Hz 抖动）
             if (mx, my) != (0, 0) and self.last_move == (mx, my):
                 score += 0.025
-            # 原地不动：远距离目标别站着，评价里已经给过"没射击解"的惩罚
+            # 原地不动：远距离目标别站着；旁边有怪时更不能站桩
             if (mx, my) == (0, 0):
                 if target is not None and math.hypot(target.x - px, target.y - py) > self.cfg.d_far:
                     score -= 0.25
+                if cur_nearest < self.cfg.d_min + 35.0:
+                    score -= 3.0
+            detail = {"score": score, "danger": danger_sum,
+                      "blocked_at": blocked_at,
+                      "nearest": eval_near,
+                      "clearance": min_cl,
+                      "crowd": len(crowd_pts)}
+            self.last_dir_scores[(mx, my)] = (
+                round(score, 2), blocked_at,
+                round(min_cl, 1) if min_cl < 1e8 else None,
+                round(danger_sum / sampled, 1) if sampled else None)
+            # 至少能走 6 帧的方向才算“通畅”；只避开 1-2 帧内的墙不够，
+            # 否则会选一个三帧后撞墙、然后原地蹭的方向。
+            if (blocked_at is None or blocked_at > 6) and score > best_clear_score:
+                best_clear_score, best_clear_dir = score, (mx, my)
+                best_clear_detail = detail
             if score > best_score:
                 best_score, best_dir = score, (mx, my)
-                best_detail = {"score": score, "danger": danger_sum,
-                               "blocked_at": blocked_at}
-        # 紧急恢复：如果所有方向都撞墙，停住等下一帧
+                best_detail = detail
+        # 优先选不会一动就撞墙的方向；如果整个角落都被封死，再用分数最高的
+        if best_clear_dir is not None:
+            return best_clear_dir, best_clear_detail
         return best_dir, best_detail
 
     # ------------------------------------------------------------------
     # A* 导航
     # ------------------------------------------------------------------
-    def astar(self, start: int, goal: int, hazard_penalty: float = 10.0) -> Optional[list[int]]:
+    def astar(self, start: int, goal: int, hazard_penalty: float = 10.0,
+              extra_cost: Optional[list[float]] = None) -> Optional[list[int]]:
         grid = self.grid
         if grid is None:
             return None
@@ -1150,13 +1287,22 @@ class TacticalAgent:
                 ng = curg + cost
                 if grid.hazardous_idx(ni):
                     ng += hazard_penalty
+                # 贴墙代价：让 A* 自然走房间中间，而不是擦着石头/墙角过。
+                # 实机里擦墙路径会让局部避让没有余量，一被追就顶进角里。
+                cl = grid.clearance()[ni]
+                if cl < 28.0:
+                    ng += (28.0 - cl) / 28.0 * 0.8
+                if extra_cost is not None:
+                    ng += extra_cost[ni]
                 if ng + 1e-9 < gscore.get(ni, 1e18):
                     gscore[ni] = ng
                     came[ni] = cur
                     heapq.heappush(open_heap, (ng + h(ni), ng, ni))
         return None
 
-    def _follow_path(self, p: dict, goal_idx: int, radius: float = 7.0) -> Optional[tuple[int, int]]:
+    def _follow_path(self, p: dict, goal_idx: int, radius: float = 7.0,
+                     extra_cost: Optional[list[float]] = None,
+                     kind: str = "nav", cost_ver: int = 0) -> Optional[tuple[int, int]]:
         grid = self.grid
         if grid is None:
             return None
@@ -1164,9 +1310,14 @@ class TacticalAgent:
         if start < 0:
             return None
         self.path_age += 1
-        if self.path_goal != goal_idx or not self.path or self.path_age > 18:
-            self.path = self.astar(start, goal_idx) or []
+        # 缓存键必须包含路径类型/代价版本：撤离路径带"避开怪"的额外代价，
+        # 不能复用普通导航的同目标路径，否则会直接从包围圈里穿过去。
+        if (self.path_goal != goal_idx or not self.path or self.path_age > 18
+                or self.path_kind != kind or self.path_cost_ver != cost_ver):
+            self.path = self.astar(start, goal_idx, extra_cost=extra_cost) or []
             self.path_goal = goal_idx
+            self.path_kind = kind
+            self.path_cost_ver = cost_ver
             self.path_age = 0
         if not self.path:
             return None
@@ -1175,16 +1326,245 @@ class TacticalAgent:
         best_i = 0
         for i in range(1, min(len(self.path), 10)):
             cx, cy = grid.center(self.path[i])
-            if grid.grid_segment_clear(px, py, cx, cy, radius=radius):
-                best_i = i
-            else:
+            if not grid.grid_segment_clear(px, py, cx, cy, radius=radius):
                 break
+            # 撤离路径不能"抄近路"从怪身边切过去：平滑后的直线也要
+            # 用同一张敌人代价图检查一遍。第一跳必须放行——被包围时
+            # 当前位置本来就在高代价区，否则永远平滑不出去、原地卡死。
+            if extra_cost is not None and i > 1 and self._segment_cost(
+                    px, py, cx, cy, extra_cost) > 6.0:
+                break
+            best_i = i
+        if best_i == 0 and len(self.path) > 1:
+            # 贴墙/贴怪导致第一个平滑点都过不了：至少朝路径下一格走
+            best_i = 1
         if best_i == len(self.path) - 1:
             cx, cy = grid.center(self.path[-1])
             if math.hypot(cx - px, cy - py) < 5.0:
                 return (0, 0)
         cx, cy = grid.center(self.path[best_i])
-        return _vec_to_dir8(cx - px, cy - py)
+        want = _vec_to_dir8(cx - px, cy - py)
+        return self._steer(p, want, cx, cy)
+
+    def _steer(self, p: dict, want: tuple[int, int], cx: float, cy: float,
+               look: float = 12.0) -> tuple[int, int]:
+        """把"朝下一格中心"的方向做一次短距碰撞修正。
+
+        8 向离散化会把"稍微偏右的上"变成纯上：路径本身是通的，但紧贴
+        障碍拐角时纯上会顶住石头，游戏里就表现为原地蹭。这里若目标方向
+        在 12px 内走不通，就改选一个仍然朝目标、但短距无障碍的方向。
+        """
+        grid = self.grid
+        px, py = float(p["x"]), float(p["y"])
+        if grid is None:
+            return want
+
+        def ok(mx: int, my: int) -> bool:
+            ux, uy = _dir8_to_vec(mx, my)
+            sx, sy = px + ux * look, py + uy * look
+            if grid.point_hazard(sx, sy):
+                return False
+            return grid.grid_segment_clear(px, py, sx, sy,
+                                           radius=self.cfg.wall_radius)
+
+        if want != (0, 0) and ok(*want):
+            return want
+        dx, dy = cx - px, cy - py
+        dl = math.hypot(dx, dy) or 1.0
+        dux, duy = dx / dl, dy / dl
+        best, best_s = None, -1e18
+        for mx, my in DIRS8:
+            if not ok(mx, my):
+                continue
+            ux, uy = _dir8_to_vec(mx, my)
+            dot = ux * dux + uy * duy
+            if dot < 0.2:
+                continue
+            sx, sy = px + ux * look, py + uy * look
+            s = dot * 2.0 + min(grid.clearance_at(sx, sy), 60.0) / 60.0 * 0.7
+            if (mx, my) == want:
+                s += 0.6
+            if (mx, my) == self.last_move:
+                s += 0.25
+            if s > best_s:
+                best, best_s = (mx, my), s
+        return best if best is not None else want
+
+    def _segment_cost(self, x0: float, y0: float, x1: float, y1: float,
+                      cost: list[float]) -> float:
+        """线段经过格子里的最大额外代价（撤离路径平滑时避开怪用）。"""
+        grid = self.grid
+        if grid is None:
+            return 0.0
+        dist = math.hypot(x1 - x0, y1 - y0)
+        steps = max(2, int(dist / (min(grid.tw, grid.th) * 0.5)) + 1)
+        worst = 0.0
+        for k in range(1, steps + 1):
+            t = k / steps
+            i = grid.idx_of(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+            if 0 <= i < len(cost):
+                worst = max(worst, cost[i])
+        return worst
+
+    # ------------------------------------------------------------------
+    # 多敌人脱离 / 墙边脱困
+    # ------------------------------------------------------------------
+    def _escape_goal_cell(self, p: dict, enemies: list[Entity],
+                          projectiles: list[Entity],
+                          hazards: list[Entity]) -> Optional[int]:
+        """在可达格子里找一个"离所有怪都远、开阔、不往弹幕里钻"的落脚点。
+
+        只看最近的那只怪会被另一只从侧面包夹；这里用候选格对所有敌人的
+        最小距离、敌群质心方向、开阔度和弹幕危险一起评分。
+        """
+        grid = self.grid
+        if grid is None:
+            return None
+        px, py = float(p["x"]), float(p["y"])
+        pidx = grid.idx_of(px, py)
+        if pidx < 0:
+            return None
+        foes = [e for e in enemies if (e.cdmg > 0 or e.boss) and e.visible]
+        if not foes:
+            return None
+        pred = [(e.x + e.vx * 10.0, e.y + e.vy * 10.0) for e in foes]
+        ecx = sum(q[0] for q in pred) / len(pred)
+        ecy = sum(q[1] for q in pred) / len(pred)
+        clear = grid.clearance()
+        n = grid.w * grid.h
+        # 撤离路径也要避开怪：只看终点会把“从怪身上穿过去”当成好路线
+        enemy_cost = [0.0] * n
+        for i in range(n):
+            if not grid.walkable_idx(i):
+                continue
+            cx, cy = grid.center(i)
+            dmin = min(math.hypot(cx - ux, cy - uy) for ux, uy in pred)
+            if dmin < 150.0:
+                enemy_cost[i] = ((150.0 - dmin) / 150.0) ** 2 * 12.0
+                if dmin < 60.0:
+                    # 贴脸格几乎不可走：宁可绕远，也不从怪身上穿过去
+                    enemy_cost[i] += 40.0
+        scored = []
+        for i in range(grid.w * grid.h):
+            if not grid.walkable_idx(i) or clear[i] < 24.0:
+                continue
+            cx, cy = grid.center(i)
+            dcur = math.hypot(cx - px, cy - py)
+            # 太近没有脱困意义；太远来不及，且容易把队友/门外的怪引进来
+            if dcur < 45.0 or dcur > 250.0:
+                continue
+            dmin = min(math.hypot(cx - ux, cy - uy) for ux, uy in pred)
+            if dmin < 45.0:
+                continue
+            score = min(dmin, 240.0) * 1.1
+            score += min(clear[i], 90.0) * 0.70
+            score -= dcur * 0.30
+            if len(foes) >= 2:
+                # 往敌群反方向跑，比单纯远离最近一只有效
+                score += min(math.hypot(cx - ecx, cy - ecy), 220.0) * 0.30
+            danger = self._danger_at(cx, cy, 10.0, projectiles, [], hazards,
+                                     grid, 1.0)
+            score -= min(120.0, danger) * 0.25
+            scored.append((score, i))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        best = None
+        # 只对前几名跑 A*，避免每帧为整张图做寻路。
+        # 注意要用"整条撤离路线的敌人代价"来比较，不能只看路长：
+        # 否则直线更短、但要从两只怪中间穿过去的格子会赢。
+        for score, i in scored[:8]:
+            path = self.astar(pidx, i, extra_cost=enemy_cost)
+            if path is None:
+                continue
+            route_cost = sum(enemy_cost[j] for j in path)
+            s = score - len(path) * 0.35 - route_cost * 0.8
+            if best is None or s > best[0]:
+                best = (s, i)
+        if best is not None:
+            # 同一份代价图交给 _follow_path，保证实际走的路线和评分时一致
+            self._escape_cost = enemy_cost
+            self._escape_ver += 1
+            return best[1]
+        self._escape_cost = None
+        return None
+
+    def _crowd_escape(self, p: dict, target: Optional[Entity],
+                      enemies: list[Entity], projectiles: list[Entity],
+                      hazards: list[Entity], threat: float) -> Optional[Action]:
+        """两三种怪同时贴上来时，暂时放弃输出，先脱离包围圈。
+
+        通用 plan_move 是逐方向评分，容易在"躲 A 就撞 B"的夹缝里选出一个
+        看起来安全、实际正走进另一只怪怀里的方向。这里直接选目标格再寻路。
+        """
+        if self.grid is None or self._jump_warn:
+            return None
+        px, py = float(p["x"]), float(p["y"])
+        ds = []
+        near = []
+        chasing = 0
+        for e in enemies:
+            if e.cdmg <= 0 and not e.boss:
+                continue
+            d = math.hypot(e.x - px, e.y - py)
+            ds.append(d)
+            if d < self.cfg.escape_radius:
+                near.append(d)
+            # 追向玩家的速度分量：站得远但正在冲过来的怪也要算威胁
+            if d > 1e-6:
+                closing = (e.vx * (px - e.x) + e.vy * (py - e.y)) / d
+                if closing > 0.5:
+                    chasing += 1
+        if not ds:
+            return None
+        self._escape_age += 1
+        nearest = min(ds)
+        # 触发得比"已经贴脸"更早：只靠 72px 硬阈值，等触发时往往已经
+        # 被两只怪夹住，任何方向都在挨打。两只会合/一起冲过来时提前拉开。
+        trigger = (nearest < 96.0
+                   or (len(near) >= 2 and nearest < self.cfg.d_min + 45.0)
+                   or (chasing >= 2 and nearest < self.cfg.d_min + 60.0)
+                   or (threat >= 0.8 and nearest < self.cfg.d_min + 15.0))
+        if not trigger:
+            self._escape_goal = None
+            self._escape_age = 0
+            self._escape_cost = None
+            return None
+        if self._escape_goal is None or self._escape_age >= 8:
+            self._escape_goal = self._escape_goal_cell(
+                p, enemies, projectiles, hazards)
+            self._escape_age = 0
+        goal = self._escape_goal
+        if goal is None:
+            return None
+        nav = self._follow_path(p, goal, radius=9.0,
+                                extra_cost=self._escape_cost,
+                                kind="escape",
+                                cost_ver=self._escape_ver)
+        if nav is None:
+            self._escape_goal = None
+            self._escape_cost = None
+            return None
+        if nav == (0, 0):
+            # 已经到落脚点了，重新交给普通战斗逻辑
+            self._escape_goal = None
+            return None
+        # 撤离时不放弃输出：只要按撤离速度仍能瞄中且脚下不危险，就边走边打。
+        # 完全停火会让清房时间变长，反而多挨几轮攻击。
+        ux, uy = _dir8_to_vec(*nav)
+        aim = (self.aim_solution(p, target, (ux * self.speed_est,
+                                             uy * self.speed_est), self.grid)
+               if target is not None else None)
+        shoot = (0, 0)
+        if (aim is not None and threat < 0.55
+                and aim["miss"] <= aim["hit_radius"] * 0.6):
+            shoot = SHOOT_DIRS[aim["dir"]]
+        return Action(move=nav, shoot=shoot, mode="crowd_escape",
+                      target_id=target.id if target else None,
+                      aim_dir=aim["dir"] if shoot != (0, 0) else 0,
+                      debug={"escape": True, "nearest": nearest,
+                             "crowd": len(near), "chasing": chasing,
+                             "goal": goal, "threat": threat})
 
     # ------------------------------------------------------------------
     # 门/探索/拾取
@@ -1645,22 +2025,49 @@ class TacticalAgent:
         else:
             self.stuck_frames = max(0, self.stuck_frames - 2)
         self.prev_pos = (px, py)
-        if self.stuck_frames > 30:
-            # 用一个短促的脱困方向打破卡死（下一帧重新评估）
+        # 贴墙/贴石头时更早认定卡住：30 帧（1 秒）在墙角已经足够被怪贴脸。
+        wall_cl = grid.clearance_at(px, py)
+        stuck_limit = 16 if (enemies and wall_cl < 30.0) else 30
+        if self.stuck_frames > stuck_limit:
+            # 不只是朝房间中心走：优先找一个远离怪、开阔的格子寻路过去
             self.stuck_frames = 0
             self.path = []
             self.path_goal = None
+            self._escape_goal = None
+            self._escape_age = 0
             self.recover_frames = 12
-            # 朝房间中心走通常最开阔
-            cx = grid.ox + grid.w * grid.tw / 2
-            cy = grid.oy + grid.h * grid.th / 2
-            self.recover_dir = _vec_to_dir8(cx - px, cy - py)
+            self.recover_goal = self._escape_goal_cell(
+                p, enemies, projectiles, hazards)
+            if self.recover_goal is not None:
+                nav = self._follow_path(p, self.recover_goal, radius=9.0,
+                                        extra_cost=self._escape_cost,
+                                        kind="recover",
+                                        cost_ver=self._escape_ver)
+                if nav is not None and nav != (0, 0):
+                    self.recover_dir = nav
+                else:
+                    self.recover_goal = None
+            if self.recover_goal is None:
+                # 没有怪或没有可达的开阔点：回房间中心通常最安全
+                cx = grid.ox + grid.w * grid.tw / 2
+                cy = grid.oy + grid.h * grid.th / 2
+                self.recover_dir = _vec_to_dir8(cx - px, cy - py)
         if self.recover_frames > 0 and not self._jump_warn:
             self.recover_frames -= 1
+            if self.recover_goal is not None:
+                nav = self._follow_path(p, self.recover_goal, radius=9.0,
+                                        extra_cost=self._escape_cost,
+                                        kind="recover",
+                                        cost_ver=self._escape_ver)
+                if nav is not None and nav != (0, 0):
+                    self.last_move = nav
+                    return Action(move=nav, mode="recover")
+            self.last_move = self.recover_dir
             return Action(move=self.recover_dir, mode="recover")
         if self._jump_warn:
             # 跳跃砸地时不能再执行“回房间中心”，否则正好撞在落点上
             self.recover_frames = 0
+            self.recover_goal = None
 
         # ---- 战斗 ----
         if enemies and not room.get("clear"):
@@ -1703,6 +2110,13 @@ class TacticalAgent:
                                "jump_land": [(round(j["x"]), round(j["y"]))
                                              for j in self._jump_warn.values()],
                                "target": (target.x, target.y) if target else None})
+            # 被两只以上怪贴近：先脱离包围，别为了多打一枪从两只怪中间穿
+            esc = self._crowd_escape(p, target, enemies, projectiles,
+                                     hazards, threat)
+            if esc is not None:
+                self.last_move = esc.move
+                self.last_shoot = (0, 0)
+                return esc
             shoot = SHOOT_DIRS[aim["dir"]] if (aim is not None and threat < 0.65) else (0, 0)
             if aim is not None and threat >= 0.65:
                 aim = None

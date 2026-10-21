@@ -6,13 +6,14 @@
   2. PostMessage 能不能驱动**没有焦点**的窗口（多开的命门）
 
 用法：
-    python test_multi.py --launch 2      # 启动 2 个实例，跑完整验证
-    python test_multi.py --attach        # 用已经开着的游戏验证（单实例）
-    python test_multi.py --launch 2 --keep   # 测完不关游戏
+    python tools/test_multi.py --launch 2      # 启动 2 个实例，跑完整验证
+    python tools/test_multi.py --attach        # 用已经开着的游戏验证（单实例）
+    python tools/test_multi.py --launch 2 --keep   # 测完不关游戏
 
 注意：新启动的实例停在主菜单，需要**手动在每个窗口里开一局**，脚本会等。
 """
 import argparse
+import os
 import sys
 import time
 
@@ -22,7 +23,8 @@ try:
 except Exception:
     pass
 
-import multi_instance as mi
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from isaac_ai import multi_instance as mi  # noqa: E402
 
 
 def describe(msg):

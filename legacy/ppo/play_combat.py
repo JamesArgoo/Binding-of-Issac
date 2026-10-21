@@ -20,7 +20,8 @@ try:
 except Exception:
     pass
 
-import multi_instance as mi
+import _bootstrap  # noqa: F401  （补齐仓库根目录）
+from isaac_ai import multi_instance as mi
 from stable_baselines3 import PPO
 from train_multi import build_envs
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""multi_instance.py —— Isaac 多开并行训练的基础设施
+"""multi_instance.py —— Isaac 多开的基础设施
 
+当前 AI 的所有“游戏外”操作都在这里：找窗口、连端口、注入按键、管理实例。
 解决三个问题：
   1. 端口分配：每个实例连自己的端口（模组在 48532..48547 里自己找）
   2. 窗口映射：Python 顺序启动实例 + 顺序等连接，天然得到 实例号 ↔ PID ↔ 窗口句柄
@@ -667,6 +668,13 @@ class ChannelAdapter:
 
 def make_envs(mgr, frame_skip=2):
     """用已启动的实例构造 gym 环境列表（一个实例一个环境）。"""
+    # 旧 PPO 训练路径；当前战术 AI 不依赖 gym/numpy。
+    # 旧模块之间仍用顶层导入，这里把 legacy/ppo 临时放进搜索路径。
+    import sys
+    legacy = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "legacy", "ppo")
+    if legacy not in sys.path:
+        sys.path.insert(0, legacy)
     from isaac_env import IsaacEnv
     envs = []
     for inst in mgr.instances:
