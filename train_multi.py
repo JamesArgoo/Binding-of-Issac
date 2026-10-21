@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """多开并行训练：N 个游戏实例同时采样，PPO 一起学。
 
 为什么能加速：每个实例的游戏都按自己 60FPS 实时推进，N 个实例并行就是
@@ -290,6 +290,7 @@ class ProgressCallback(BaseCallback):
         self.ep_rews = []
         self.ep_hurts = []
         self.ep_dealts = []
+        self.ep_hits = []
         self.clear_cnt = 0
         self.hurtfail_cnt = 0
 
@@ -311,6 +312,8 @@ class ProgressCallback(BaseCallback):
                 self.ep_hurts = self.ep_hurts[-30:]
                 self.ep_dealts.append(float(info.get("ep_dealt", 0.0) or 0.0))
                 self.ep_dealts = self.ep_dealts[-30:]
+                self.ep_hits.append(float(info.get("hit_rate", 0.0) or 0.0))
+                self.ep_hits = self.ep_hits[-30:]
                 if info.get("clear"):
                     self.clear_cnt += 1
                 if info.get("hurt_fail"):
@@ -357,10 +360,11 @@ class ProgressCallback(BaseCallback):
             avg_hurt = sum(self.ep_hurts) / len(self.ep_hurts)
             avg_dealt = sum(self.ep_dealts) / len(self.ep_dealts)
             clr = 100.0 * self.clear_cnt / max(1, self.episodes)
+            hit = (100.0 * sum(self.ep_hits) / len(self.ep_hits)) if self.ep_hits else 0.0
             hf = (f"  因受伤终止 {self.hurtfail_cnt}"
                   if self.hurtfail_cnt else "")
             print(f"           最近 30 回合：平均受伤 {avg_hurt:.2f} 点  "
-                  f"平均输出 {avg_dealt:.0f} 伤害  清房率 {clr:.0f}%{hf}")
+                  f"平均输出 {avg_dealt:.0f} 伤害  命中率 {hit:.0f}%  清房率 {clr:.0f}%{hf}")
         return True
 
 
@@ -393,7 +397,9 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                enemy_types=None, exclude_enemy_types=None,
                terrain_mode="local", hit_rew=None, cost_miss=None, fps=None,
                reset_mode="restart", hurt_scale=None, fail_on_hurt=False,
-               min_hp=3.0, align_off=None):
+               min_hp=3.0, align_off=None,
+               miss_pen=None, align_shoot_pen=None,
+               align_shoot_bonus=None, align_tol=None):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -415,8 +421,8 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
         kw["hurt_scale"] = hurt_scale
     kw["fail_on_hurt"] = bool(fail_on_hurt)
     kw["min_hp"] = float(min_hp)
-    if align_off is not None:
-        kw["align_off"] = float(align_off)
+    if align_off is not None:        kw["align_off"] = float(align_off)
+    if miss_pen is not None:        kw["miss_pen"] = float(miss_pen)
     # fail_on_hurt + keep 不相容：keep 不重开，血量会一路往下掉，
     # 于是"掉血即结束"的回合越跑越短、最后卡在濒死状态。
     # auto 没这个问题（血量低于 min_hp 就会重开补满），所以只有 keep 需要拦。
@@ -484,6 +490,16 @@ def main():
                          "auto=血量 >= --min-hp 就 goto、太低才重开（推荐）")
     ap.add_argument("--min-hp", type=float, default=3.0,
                     help="auto 模式的补血阈值：血量低于它才整局重开（默认 3）")
+    ap.add_argument("--align-shoot-pen", type=float, default=None,
+                    help="开枪时没对准的惩罚（默认 3.0，**立即生效**）。这是决策级信号，"
+                         "比按泪弹落点算的 --miss-pen 好学得多")
+    ap.add_argument("--align-shoot-bonus", type=float, default=None,
+                    help="射对轴且已对齐时开枪的小奖励（默认 1.0）")
+    ap.add_argument("--align-tol", type=float, default=None,
+                    help="判定对齐的容差（世界单位，默认 18 ≈ 半格）")
+    ap.add_argument("--miss-pen", type=float, default=None,
+                    help="每发打空扣多少原始分（默认 1.5）。配合 --hit-rew 2.0 时"
+                         "盈亏平衡命中率约 18%%，低于它继续乱喷就是净亏")
     ap.add_argument("--align-off", type=float, default=None,
                     help="对齐势权重（默认 1.0）：奖励把非射击轴偏移消掉。"
                          "泪弹只有 4 方向，不对齐就打不中；原来这一项完全没有，"
@@ -608,7 +624,11 @@ def main():
                       hit_rew=args.hit_rew, cost_miss=args.cost_miss,
                       fps=decision_fps, reset_mode=args.reset_mode,
                       hurt_scale=args.hurt_scale, fail_on_hurt=args.fail_on_hurt,
-                      align_off=args.align_off)
+                      align_off=args.align_off,
+                      miss_pen=args.miss_pen,
+                      align_shoot_pen=args.align_shoot_pen,
+                      align_shoot_bonus=args.align_shoot_bonus,
+                      align_tol=args.align_tol)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")

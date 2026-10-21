@@ -45,6 +45,12 @@ COST_MISS = 2.0         # 命中率=0 时每秒的时间代价
 CLEAR = 40.0            # 清房（AIsaac ROOM_POINTS['normal']=40）
 DEATH = 5.0             # 死亡固定惩罚
 ALIGN = 0.2             # 距离势权重（AIsaac HRW align=0.2）：鼓励站在刚好打得到的距离
+ALIGN_SHOOT_PEN = 3.0   # 开枪时"没对准"的惩罚（原始分，立即生效）
+ALIGN_SHOOT_BONUS = 1.0 # 射对轴且已对齐时开枪的小奖励
+ALIGN_TOL = 18.0        # 判定"对齐"的容差（世界单位，约半格；敌人半径 12 + 泪弹 5）
+MISS_PEN = 1.5          # 每发"打空"的惩罚（原始分）。盈亏平衡命中率约 18%
+                        # 用户明确要求"不要空打乱打"，这是把命中/空搭做成直接奖励项
+                        # 而非原来那个间接的"命中率->时间代价"。
 ALIGN_OFF = 1.0         # **对齐势**权重：奖励"把自己的行/列挪到和敌人一致"
                         # 以撒的泪弹只有 4 个方向，敌人斜着时无论怎么按都打不中，
                         # 必须先把"非射击轴"上的偏移消掉。原来的奖励里只有距离势
@@ -104,7 +110,9 @@ class CombatEnv(gym.Env):
     def __init__(self, bridge, controller, variants=(12, 13, 14),
                  frame_skip=2, max_steps=None, seed=None, chunk=1,
                  terrain_mode=TERRAIN_LOCAL, fps=None,
-                 hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart",                 hurt_scale=1.0, fail_on_hurt=False, min_hp=3.0, align_off=ALIGN_OFF):
+                 hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart",                 hurt_scale=1.0, fail_on_hurt=False, min_hp=3.0, align_off=ALIGN_OFF, miss_pen=MISS_PEN,
+                 align_shoot_pen=ALIGN_SHOOT_PEN, align_shoot_bonus=ALIGN_SHOOT_BONUS,
+                 align_tol=ALIGN_TOL):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
@@ -134,6 +142,11 @@ class CombatEnv(gym.Env):
         self.min_hp = float(min_hp)
         # 对齐势权重：奖励"把非射击轴上的偏移消掉"（泪弹只有 4 方向，不对齐打不中）
         self.align_off = float(align_off)
+        # 空打惩罚：每发没打中的泪弹扣多少（原始分，最后统一 x SCALE）
+        self.miss_pen = float(miss_pen)
+        self.align_shoot_pen = float(align_shoot_pen)
+        self.align_shoot_bonus = float(align_shoot_bonus)
+        self.align_tol = float(align_tol)
         self.last_reset_s = 0.0     # 上一次 reset 花了多少秒（诊断）
         self.last_ep_steps = 0      # 上一回合走了多少步（诊断）
         self._reset_fallbacks = 0   # goto 连试 4 次都没进战斗房的次数（诊断）
@@ -433,7 +446,7 @@ class CombatEnv(gym.Env):
             if not s or "player" not in s:
                 break
 
-            r, term, info = self._reward(s, mx, my)
+            r, term, info = self._reward(s, mx, my, shoot_a)
             total_r += r
             if term:
                 terminated = True
@@ -448,7 +461,7 @@ class CombatEnv(gym.Env):
             self.kc.release_all()
         return obs, float(total_r), bool(terminated), bool(truncated), info
 
-    def _reward(self, s, mx=0, my=0):
+    def _reward(self, s, mx=0, my=0, shoot_a=0):
         p = s["player"]
         cur_hp, cur_alive = self._scan_enemies(s)
         hp_now = float(p["hp"]) + float(p["soul_hp"])
@@ -471,9 +484,41 @@ class CombatEnv(gym.Env):
         rate = self.hit_rate()
 
         r = 0.0
+        # ---- 逐发结算：打中加分、空打重罚 ----
+        # 用户要求"不要空打乱打"，所以把命中/空打做成**直接的**奖励项，
+        # 而不是原来那个间接的"命中率越高时间代价越便宜"。
+        # 泪弹要飞几帧才落地，所以单步的 fired/hits 是错位的；
+        # 但整局累计是守恒的（∑fired = 总发数，∑hits = 总伤害/单发伤害），
+        # 错位只引入噪声，不改变总量。
+        # 盈亏平衡命中率 ≈ hit_rew*damage / (hit_rew*damage + miss_pen)：
+        #   hit_rew=2.0, miss_pen=1.5, damage=3.5 -> 7.0/(7.0+1.5) ≈ 18%
+        # 低于这个命中率继续乱喷就是净亏，逼它先对齐再开枪。
         r += max(0.0, dealt) * self.hit_rew
+        missed = max(0.0, fired - hits)
+        r -= missed * self.miss_pen
         r += kills * KILL
         r -= time_price(rate, self.cost_miss, COST_HIT) * (self.frame_skip / 60.0)
+
+        # ---- 决策级的「对齐射击」信号（立即生效）----
+        # 上面的 miss_pen 是**结果级**的：打在墙上才扣分，而泪弹要飞几帧才落地，
+        # 实测跑 47k 步命中率纹丝不动（31~44% 来回摆）—— 延迟+噪声，信用分配学不动。
+        # 这里换成**决策级**：开枪的那一刻就能判断"我是否对准了"，立刻给信号。
+        #   aligned = 非射击轴偏移 <= align_tol（泪弹半径+敌人半径，约半格）
+        #   射对轴 + 已对齐 -> 小奖励；否则开枪 -> 重罚
+        # 这正是「对齐直线再开枪」这个子技能，也是用户明确要求的行为。
+        if shoot_a:
+            _ens = get_enemies(s)
+            if _ens:
+                near2 = min(_ens,
+                            key=lambda e: (e["x"] - p["x"]) ** 2 + (e["y"] - p["y"]) ** 2)
+                dx2, dy2 = near2["x"] - p["x"], near2["y"] - p["y"]
+                horizontal2 = abs(dx2) >= abs(dy2)
+                off2 = abs(dy2) if horizontal2 else abs(dx2)
+                want_axis = (2 if dx2 > 0 else 4) if horizontal2 else (3 if dy2 > 0 else 1)
+                if off2 <= self.align_tol and int(shoot_a) == want_axis:
+                    r += self.align_shoot_bonus
+                else:
+                    r -= self.align_shoot_pen
 
         # ---- 顶墙/顶障碍物惩罚 ----
         #     想走的方向是墙、石头、便便就直接扣分：逼 AI 别对着障碍物干瞪眼。
