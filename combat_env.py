@@ -112,7 +112,8 @@ class CombatEnv(gym.Env):
                  terrain_mode=TERRAIN_LOCAL, fps=None,
                  hit_rew=HIT_REW, cost_miss=COST_MISS, reset_mode="restart",                 hurt_scale=1.0, fail_on_hurt=False, min_hp=3.0, align_off=ALIGN_OFF, miss_pen=MISS_PEN,
                  align_shoot_pen=ALIGN_SHOOT_PEN, align_shoot_bonus=ALIGN_SHOOT_BONUS,
-                 align_tol=ALIGN_TOL):
+                 align_tol=ALIGN_TOL, d_opt=D_OPT, lead_align=False, dist_w=ALIGN,
+                 align_on_spawn=True):
         super().__init__()
         self.bridge = bridge
         self.kc = controller
@@ -146,6 +147,26 @@ class CombatEnv(gym.Env):
         self.miss_pen = float(miss_pen)
         self.align_shoot_pen = float(align_shoot_pen)
         self.align_shoot_bonus = float(align_shoot_bonus)
+        # 理想交战距离。oracle_eval.py 在真实游戏里量过"现在开枪能不能中"的窗口：
+        #   距离 80-120  → 对齐率 59%，可命中 57%
+        #   距离 120-180 → 对齐率 27%，可命中 14%
+        #   距离 >300    → 对齐率 7%， 可命中 7%（而且玩家有 50% 的时间待在这个区间）
+        # 泪弹速度 ~10/帧，150 像素要飞 15 帧，敌人早就漂出判定框了。
+        # 所以 150 这个老默认值偏远，调小能直接把命中窗口放大好几倍。
+        self.d_opt = float(d_opt)
+        # 是否用"提前量预测"来判对齐。实测（Stage 5）**默认关闭**：
+        # 判得更准反而更差 —— 罚得更严后模型干脆少开枪，回合从 185 步拖到 290 步，
+        # 清房率从 89% 掉到 84%（宁可慢也不打"可能偏"的枪）。想复现/对比再打开。
+        self.lead_align = bool(lead_align)
+        # 距离势权重（原 ALIGN=0.2）。oracle_eval 量到玩家有 50% 的时间待在 >300 外，
+        # 那里可命中只有 6.7%。加大它能把"龟缩远距离"变得不划算，逼它进交战距离。
+        self.dist_w = float(dist_w)
+        # 只在**真的射出一发泪弹**的那一帧判"对齐射击"，而不是"每一帧按着开火键"都判。
+        # 为什么重要：Isaac 是"按住方向连续射"，射速冷却约 10 帧才出 1 发，
+        # 所以按帧判会让惩罚密度变成实际发弹数的 ~10 倍 ——
+        # 模型感受到的是"一直扣分"，于是干脆松手不射（实测平均输出从 14 掉到 10），
+        # 而不是"选对时机再射"。改成按发判之后，信号才和物理事实一一对应。
+        self.align_on_spawn = bool(align_on_spawn)
         self.align_tol = float(align_tol)
         self.last_reset_s = 0.0     # 上一次 reset 花了多少秒（诊断）
         self.last_ep_steps = 0      # 上一回合走了多少步（诊断）
@@ -401,7 +422,7 @@ class CombatEnv(gym.Env):
             near0 = min(enemies0,
                         key=lambda e: (e["x"] - pp["x"]) ** 2 + (e["y"] - pp["y"]) ** 2)
             d0 = math.hypot(near0["x"] - pp["x"], near0["y"] - pp["y"])
-            self._prev_phi = -ALIGN * abs(d0 - D_OPT) / CELL
+            self._prev_phi = -self.dist_w * abs(d0 - self.d_opt) / CELL
             dx0 = near0["x"] - pp["x"]
             dy0 = near0["y"] - pp["y"]
             off0 = abs(dy0) if abs(dx0) >= abs(dy0) else abs(dx0)
@@ -506,16 +527,38 @@ class CombatEnv(gym.Env):
         #   aligned = 非射击轴偏移 <= align_tol（泪弹半径+敌人半径，约半格）
         #   射对轴 + 已对齐 -> 小奖励；否则开枪 -> 重罚
         # 这正是「对齐直线再开枪」这个子技能，也是用户明确要求的行为。
-        if shoot_a:
+        #
+        # 关键改进：判定用**提前量预测**，不是"现在"的偏移。
+        # 泪弹速度 ~10 单位/帧，交战距离 100 → 要飞 10 帧；这 10 帧里敌人已经挪开了。
+        # 原来拿"开枪那一刻"的偏移判定，会把"现在对齐、飞到时早已偏掉"的坏枪也算成好枪，
+        # 于是模型学到的是"当前同轴就开枪"，命中率自然上不去（实测卡在 35%）。
+        # 现在按 敌人预测位置 = 当前位置 + 速度 × 飞行帧数 来判，和真实命中判定一致。
+        if shoot_a and (fired > 0 or not self.align_on_spawn):
             _ens = get_enemies(s)
             if _ens:
                 near2 = min(_ens,
                             key=lambda e: (e["x"] - p["x"]) ** 2 + (e["y"] - p["y"]) ** 2)
                 dx2, dy2 = near2["x"] - p["x"], near2["y"] - p["y"]
-                horizontal2 = abs(dx2) >= abs(dy2)
-                off2 = abs(dy2) if horizontal2 else abs(dx2)
-                want_axis = (2 if dx2 > 0 else 4) if horizontal2 else (3 if dy2 > 0 else 1)
-                if off2 <= self.align_tol and int(shoot_a) == want_axis:
+                dist2 = math.hypot(dx2, dy2)
+                # 判"这一枪"的方向轴：它实际按的是哪个方向
+                sax, say = SHOOT_DIRS[int(shoot_a)] if int(shoot_a) < len(SHOOT_DIRS) else (0, 0)
+                if self.lead_align:
+                    # 提前量版：用 敌人预测位置 = 当前位置 + 速度 × 飞行帧数 来判
+                    _spd = max(float(p.get("shot_speed", 10.0) or 10.0), 1e-3)
+                    _T = dist2 / _spd
+                    ex_p = near2["x"] + float(near2.get("vx", 0) or 0) * _T
+                    ey_p = near2["y"] + float(near2.get("vy", 0) or 0) * _T
+                else:
+                    ex_p, ey_p = near2["x"], near2["y"]
+                if sax != 0:                       # 水平射击 -> 垂直偏移才是误差
+                    off2 = abs(ey_p - p["y"])
+                elif say != 0:                     # 垂直射击 -> 水平偏移才是误差
+                    off2 = abs(ex_p - p["x"])
+                else:
+                    off2 = 1e9
+                # 敌人是否在射击方向上（朝反方向开枪必然是坏枪）
+                in_front = (sax * dx2 + say * dy2) > 0
+                if off2 <= self.align_tol and in_front:
                     r += self.align_shoot_bonus
                 else:
                     r -= self.align_shoot_pen
@@ -554,7 +597,7 @@ class CombatEnv(gym.Env):
             near = min(enemies_all,
                        key=lambda e: (e["x"] - p["x"]) ** 2 + (e["y"] - p["y"]) ** 2)
             d = math.hypot(near["x"] - p["x"], near["y"] - p["y"])
-            phi = -ALIGN * abs(d - D_OPT) / CELL
+            phi = -self.dist_w * abs(d - self.d_opt) / CELL
             # 主轴 = 偏移大的那个轴（泪弹就往那个方向射），另一轴就是"对齐误差"
             dx, dy = near["x"] - p["x"], near["y"] - p["y"]
             off = abs(dy) if abs(dx) >= abs(dy) else abs(dx)

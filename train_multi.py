@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """多开并行训练：N 个游戏实例同时采样，PPO 一起学。
 
 为什么能加速：每个实例的游戏都按自己 60FPS 实时推进，N 个实例并行就是
@@ -399,7 +399,8 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
                reset_mode="restart", hurt_scale=None, fail_on_hurt=False,
                min_hp=3.0, align_off=None,
                miss_pen=None, align_shoot_pen=None,
-               align_shoot_bonus=None, align_tol=None):
+               align_shoot_bonus=None, align_tol=None, d_opt=None,
+               lead_align=False, dist_w=None, align_on_spawn=True):
     """用管理器里的实例构造环境列表。
 
     combat=True 用单房间战斗环境（照 AIsaac 的设定，推荐）；
@@ -423,6 +424,13 @@ def build_envs(mgr, combat=False, catalog="room_catalog.json", frame_skip=2,
     kw["min_hp"] = float(min_hp)
     if align_off is not None:        kw["align_off"] = float(align_off)
     if miss_pen is not None:        kw["miss_pen"] = float(miss_pen)
+    if d_opt is not None:           kw["d_opt"] = float(d_opt)
+    if dist_w is not None:          kw["dist_w"] = float(dist_w)
+    kw["lead_align"] = bool(lead_align)
+    kw["align_on_spawn"] = bool(align_on_spawn)
+    if align_shoot_pen is not None: kw["align_shoot_pen"] = float(align_shoot_pen)
+    if align_shoot_bonus is not None: kw["align_shoot_bonus"] = float(align_shoot_bonus)
+    if align_tol is not None:       kw["align_tol"] = float(align_tol)
     # fail_on_hurt + keep 不相容：keep 不重开，血量会一路往下掉，
     # 于是"掉血即结束"的回合越跑越短、最后卡在濒死状态。
     # auto 没这个问题（血量低于 min_hp 就会重开补满），所以只有 keep 需要拦。
@@ -504,6 +512,19 @@ def main():
                     help="对齐势权重（默认 1.0）：奖励把非射击轴偏移消掉。"
                          "泪弹只有 4 方向，不对齐就打不中；原来这一项完全没有，"
                          "是「打不准」的头号原因")
+    ap.add_argument("--d-opt", type=float, default=None,
+                    help="理想交战距离（世界单位，默认 150）。oracle_eval.py 实测："
+                         "80-120 的可命中窗口 57%%、120-180 只有 14%%、>300 只有 7%%，"
+                         "因为泪弹飞 15 帧敌人早就漂出判定框了。往小调能直接放大命中窗口")
+    ap.add_argument("--dist-w", type=float, default=None,
+                    help="距离势权重（默认 0.2）。实测玩家有 50%% 的时间待在 >300 外，"
+                         "那里可命中只有 6.7%%；加大它能把「龟缩远距离」变得不划算")
+    ap.add_argument("--lead-align", action="store_true",
+                    help="用提前量预测判对齐（默认关）。实测更差：罚太严 -> 少开枪 -> "
+                         "回合变长、清房率下降，只留作对比实验")
+    ap.add_argument("--no-align-on-spawn", action="store_true",
+                    help="关掉「只在真射出泪弹那帧判对齐」（即退回按帧判）。"
+                         "按帧判会让惩罚密度变成实际发弹数的 ~10 倍，模型会干脆松手不射")
     ap.add_argument("--hurt-scale", type=float, default=None,
                     help="受伤惩罚倍率（默认 1.0）。--hit-rew 调到 1.0 后，一个回合"
                          "打出的伤害约 28 分、掉光血只扣 12 分，于是贴脸换血最优；"
@@ -628,7 +649,11 @@ def main():
                       miss_pen=args.miss_pen,
                       align_shoot_pen=args.align_shoot_pen,
                       align_shoot_bonus=args.align_shoot_bonus,
-                      align_tol=args.align_tol)
+                      align_tol=args.align_tol,
+                      d_opt=args.d_opt,
+                      dist_w=args.dist_w,
+                      lead_align=args.lead_align,
+                      align_on_spawn=not args.no_align_on_spawn)
     venv = VecMonitor(ParallelIsaacVecEnv(envs))
     odim = obs_dim(terrain_mode)
     print(f"\n并行环境就绪：{venv.num_envs} 个实例")
@@ -639,6 +664,8 @@ def main():
     if hasattr(e0, "hit_rew"):
         print(f"奖励尺度：命中 {e0.hit_rew}/点伤害   时间代价 {e0.cost_miss}/秒   "
               f"受伤 x{e0.hurt_scale}   决策 {e0.fps:.1f} 步/秒")
+        print(f"  理想交战距离 {e0.d_opt:.0f}   对齐容差 {e0.align_tol:.0f}   "
+              f"空打 -{e0.miss_pen}   错轴开枪 -{e0.align_shoot_pen}")
         if e0.fail_on_hurt:
             print("  课程：不允许受伤 —— 掉任何一点血就结束本回合")
         print(f"  回合重置：{e0.reset_mode}"

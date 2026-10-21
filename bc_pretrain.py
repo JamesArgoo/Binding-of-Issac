@@ -185,8 +185,12 @@ def _vec_to_move(ux, uy):
     return idx
 
 
-def _make_state(px, py, ex, ey, grid):
-    """拼一个符合模组 schema 的最小状态，直接喂 build_obs。"""
+def _make_state(px, py, ex, ey, grid, evx=0.0, evy=0.0, shot_speed=10.0):
+    """拼一个符合模组 schema 的最小状态，直接喂 build_obs。
+
+    evx/evy 是**敌人的速度**：BC 的门控标签要用它算提前量（"这发飞到时还在轴上吗"）。
+    shot_speed 是玩家的泪速（模组里实测约 10 单位/帧）。
+    """
     w = grid["w"]
     tw, th, ox, oy = grid["tw"], grid["th"], grid["ox"], grid["oy"]
     idx = int((py - oy) / th) * w + int((px - ox) / tw)
@@ -198,7 +202,7 @@ def _make_state(px, py, ex, ey, grid):
             "coins": 0, "bombs": 0, "keys": 0,
             "active_item": 0, "active_charge": 0, "pocket_item": 0, "card": 0,
             "damage": 3.5, "move_speed": 1.0, "tear_range": 260.0,
-            "shot_speed": 10.0, "fire_delay": 8.0, "size": 10.0,
+            "shot_speed": shot_speed, "fire_delay": 8.0, "size": 10.0,
             "grid_idx": idx, "fire_dir": -1, "head_dir": -1, "iframes": 0,
         },
         "room": {"type": 1, "index": -3, "enemies_alive": 1,
@@ -209,7 +213,7 @@ def _make_state(px, py, ex, ey, grid):
              "dead": False, "spawner_type": 0, "size": 10.0, "height": 0.0,
              "coll": 4, "cdmg": 0.0, "gcoll": 1, "grid_idx": idx},
             {"id": 100, "type": 10, "variant": 0, "subtype": 0, "x": ex, "y": ey,
-             "vx": 0.0, "vy": 0.0, "hp": 20.0, "boss": False, "enemy": True,
+             "vx": evx, "vy": evy, "hp": 20.0, "boss": False, "enemy": True,
              "dead": False, "spawner_type": 0, "size": 12.0, "height": 0.0,
              "coll": 1, "cdmg": 0.0, "gcoll": 1, "grid_idx": 0},
         ],
@@ -225,11 +229,45 @@ def pick_grid(frames):
     return D.normalize_grid(dict(D.demo_grid())), None
 
 
-def collect(frames, grid, terrain_mode, per_frame=120, seed=0):
+def gate_label(px, py, ex, ey, evx, evy, shot_speed, sh, grid, tol=18.0,
+               need_los=False):
+    """「该不该开枪」的规则标签：只在**泪弹飞到时**还打在轴上时才开火。
+
+    这是 BC 里最关键的一块。原来的规则老师只会"永远朝敌人瞄"，开不开枪交给 PPO
+    去学；实测 PPO 学不会（命中率卡在 30~45%，而完美门控能到 47~65%）。
+    既然 BC 一学就会（回归自检 4/4），就把"何时该开火"也做成监督标签。
+
+    物理依据：泪弹速度 ~10 单位/帧，距离 d 要飞 T=d/10 帧；
+    这 T 帧里敌人已经顺着 (evx,evy) 挪开了。所以判的是
+        |垂直偏移(敌人预测位置)| <= tol
+    而不是"现在"的偏移 —— 这是 `oracle_eval.py` 量出来的、唯一和真实命中对得上的判据。
+    """
+    if sh == 0:
+        return 0
+    dx, dy = ex - px, ey - py
+    dist = math.hypot(dx, dy)
+    T = dist / max(shot_speed, 1e-6)
+    ex_p, ey_p = ex + evx * T, ey + evy * T
+    off = abs(ey_p - py) if sh in (2, 4) else abs(ex_p - px)
+    if off > tol:
+        return 0
+    if need_los and grid:
+        span = _los(px, py, grid)[sh - 1]
+        tw = max(grid["tw"], 1e-6)
+        if span + 0.5 < dist / tw:
+            return 0
+    return sh
+
+
+def collect(frames, grid, terrain_mode, per_frame=120, seed=0, gate=False,
+            gate_tol=18.0, gate_los=False, enemy_speed=0.0):
     """造 (obs, target_move, target_shoot) 监督数据。
 
     以真实帧里的玩家位置为锚点，把敌人摆到周围的随机方位/距离上 ——
     这样少量真实地形也能产出足够多、覆盖全方位的样本。
+
+    gate=True 时用 `gate_label` 把"不该开枪"的样本标成 0（教它等时机）；
+    enemy_speed>0 时给敌人随机速度，教它算**提前量**（观测里本来就有 vx/vy）。
     """
     rng = np.random.default_rng(seed)
     w, h = grid["w"], grid["h"]
@@ -246,16 +284,32 @@ def collect(frames, grid, terrain_mode, per_frame=120, seed=0):
                             oy + rng.uniform(2, h - 2) * th))
 
     X, Ym, Ys = [], [], []
+    n_gate_off = 0
     for ax, ay in anchors:
         for _ in range(per_frame):
             ang = rng.uniform(0, 2 * math.pi)
             r = rng.uniform(60.0, 420.0)
             ex, ey = ax + r * math.cos(ang), ay + r * math.sin(ang)
-            st = _make_state(ax, ay, ex, ey, grid)
+            evx = evy = 0.0
+            if enemy_speed > 0:
+                evx = float(rng.uniform(-enemy_speed, enemy_speed))
+                evy = float(rng.uniform(-enemy_speed, enemy_speed))
+            st = _make_state(ax, ay, ex, ey, grid, evx, evy)
             m, sh = rule_action(st, grid)
+            if gate:
+                sh2 = gate_label(ax, ay, ex, ey, evx, evy, 10.0, sh, grid,
+                                 tol=gate_tol, need_los=gate_los)
+                if sh2 == 0 and sh != 0:
+                    n_gate_off += 1
+                sh = sh2
             X.append(build_obs(st, grid, terrain_mode))
             Ym.append(m)
             Ys.append(sh)
+    if gate:
+        total = len(Ys)
+        quiet = sum(1 for v in Ys if v == 0)
+        print(f"门控标签：{quiet}/{total} = {quiet/max(total,1)*100:.1f}% 标为「不射」"
+              f"（其中 {n_gate_off} 条是「该射但现在不该射」）")
     return (np.asarray(X, dtype=np.float32),
             np.asarray(Ym, dtype=np.int64),
             np.asarray(Ys, dtype=np.int64))
@@ -276,6 +330,16 @@ def main():
                     help="地形模式；默认按 --frames 的模型推断，没有就用 full")
     ap.add_argument("--load", default=None,
                     help="在这个模型上继续 BC（不给就新建随机权重的网络）")
+    ap.add_argument("--gate", action="store_true",
+                    help="教「何时该开枪」：只在提前量预测能命中时才标成开火。"
+                         "实测这是 PPO 学不会、BC 一学就会的部分")
+    ap.add_argument("--gate-tol", type=float, default=18.0,
+                    help="门控容差（世界单位，默认 18 ≈ 半格）：预测垂直偏移超过它就不射")
+    ap.add_argument("--gate-los", action="store_true",
+                    help="门控时额外要求视线畅通（避免对着石头开枪）")
+    ap.add_argument("--enemy-speed", type=float, default=0.0,
+                    help="给敌人加多大随机速度（单位/帧）。设 1.5~2.5 能教它算提前量")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     frames = None
@@ -293,7 +357,9 @@ def main():
     dim = obs_dim(terrain_mode)
     print(f"地形 {terrain_mode} → 观测 {dim} 维；房间 {grid['w']}×{grid['h']}")
 
-    X, Ym, Ys = collect(frames, grid, terrain_mode, args.steps_per_anchor)
+    X, Ym, Ys = collect(frames, grid, terrain_mode, args.steps_per_anchor,
+                        seed=args.seed, gate=args.gate, gate_tol=args.gate_tol,
+                        gate_los=args.gate_los, enemy_speed=args.enemy_speed)
     print(f"监督样本 {len(X)} 条（射击标签 5 类，移动标签 9 类）")
 
     # ---- 给出网络 ----
@@ -407,6 +473,24 @@ def main():
           f"视线 上{los[0]:.0f} 右{los[1]:.0f} 下{los[2]:.0f} 左{los[3]:.0f} 格")
     print(f"  观测里的视线块 = {np.round(o[l0:l1], 2)}（左=0 说明左边紧贴墙）")
     print("  BC 不教「该不该开枪」，这部分交给 PPO：打空会拉低命中率 -> 时间代价变贵")
+
+    # ---- 自检 4：提前量门控（只有 --gate 才有意义）----
+    if args.gate:
+        print("\n自检 4（提前量门控：敌人横着漂，该等到漂回轴上再开枪）：")
+        for label, vy in (("静止", 0.0), ("下漂 +1/帧", 1.0),
+                          ("下漂 +3/帧", 3.0), ("下漂 +6/帧", 6.0)):
+            st = _make_state(ax, ay, ax + 150, ay, grid, 0.0, vy)
+            o = build_obs(st, grid, terrain_mode)
+            gate_v = gate_label(ax, ay, ax + 150, ay, 0.0, vy, 10.0, 2, grid,
+                                tol=args.gate_tol)
+            with torch.no_grad():
+                ds = pol.get_distribution(
+                    torch.as_tensor(o[None], dtype=torch.float32)).distribution
+                p = ds[1].probs.cpu().numpy()[0]
+            a_shot = SHOOT_NAMES[int(np.argmax(p))]
+            print(f"  敌人正右150 {label:<10} 规则标签={SHOOT_NAMES[gate_v]:<3} "
+                  f"模型={a_shot:<3}  "
+                  + " ".join(f"{SHOOT_NAMES[i]}{p[i]:.0%}" for i in range(5)))
 
     out = args.out
     model.save(out)
