@@ -2,10 +2,11 @@
 """test_tactical_agent.py —— 不用开游戏，验证战术 AI 的瞄准/门控/躲弹/绕障。
 
 运行：
-    python test_tactical_agent.py
+    python tests/test_tactical_agent.py
 """
 import json
 import math
+import os
 import sys
 
 try:
@@ -13,9 +14,57 @@ try:
 except Exception:
     pass
 
-import isaac_data as D
-from tactical_agent import (Config, TacticalAgent, RoomGrid, DIRS8,
-                            SHOOT_DIRS, ROOM_DELTA, _dir8_to_vec, split_entities)
+# 允许直接 `python tests/test_tactical_agent.py`
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from isaac_ai.tactical_agent import (Config, TacticalAgent, RoomGrid, DIRS8,
+                                     SHOOT_DIRS, ROOM_DELTA, _dir8_to_vec,
+                                     split_entities)
+
+DEMO_W, DEMO_H = 15, 9
+CELL = 40.0
+DEMO_OX, DEMO_OY = -280.0, -140.0     # 房间左上角的世界坐标
+_DEMO_GRID_CACHE = {}
+
+
+def demo_grid(w=DEMO_W, h=DEMO_H):
+    """合成一张典型房间网格，离线测试用（不依赖任何第三方库）。"""
+    key = (w, h)
+    if key in _DEMO_GRID_CACHE:
+        return _DEMO_GRID_CACHE[key]
+    coll = [0] * (w * h)
+    ent = [0] * (w * h)
+
+    def put(gx, gy, c, e):
+        if 0 <= gx < w and 0 <= gy < h:
+            coll[gy * w + gx] = c
+            ent[gy * w + gx] = e
+
+    for gx in range(w):                      # 上下墙
+        put(gx, 0, 4, 15)
+        put(gx, h - 1, 4, 15)
+    for gy in range(h):                      # 左右墙
+        put(0, gy, 4, 15)
+        put(w - 1, gy, 4, 15)
+    for gx, gy in ((w // 2, 0), (w // 2, h - 1), (0, h // 2), (w - 1, h // 2)):
+        put(gx, gy, 5, 16)                   # 门：coll=5 玩家可过
+
+    for gx, gy in ((3, 2), (4, 2), (3, 3), (4, 3), (11, 2)):   # 石头
+        put(gx, gy, 3, 2)
+    put(10, 6, 3, 14)                        # 便便
+    put(12, 6, 1, 7)                         # 坑
+    put(5, 6, 2, 8)                          # 尖刺
+
+    grid = {
+        "w": w, "h": h,
+        "cells": [1 if c in (0, 5) else 0 for c in coll],
+        "coll": coll, "ent": ent,
+        "gv": 2,
+        "ox": DEMO_OX, "oy": DEMO_OY,
+        "tw": CELL, "th": CELL,
+    }
+    _DEMO_GRID_CACHE[key] = grid
+    return grid
 
 
 def mk_state(grid, px, py, enemies=(), bullets=(), pickups=(), clear=False,
@@ -135,7 +184,7 @@ def run_case(name, fn):
 
 
 def main():
-    grid = D.demo_grid(15, 9)
+    grid = demo_grid(15, 9)
     px, py = center(grid, 7, 4)
     print(f"测试房间 {grid['w']}x{grid['h']} player=({px},{py})")
     ok = []
@@ -145,7 +194,8 @@ def main():
         ag = TacticalAgent()
         a = ag.act(st)
         assert a.shoot == (1, 0), f"应朝右射，实际 {a.shoot}"
-        aim = ag.aim_solution(st["player"], __import__("tactical_agent").split_entities(st)[0][0], (0, 0), ag.grid)
+        aim = ag.aim_solution(st["player"], split_entities(st)[0][0],
+                              (0, 0), ag.grid)
         assert aim and aim["dir"] == 2, f"瞄准解错误 {aim}"
         print(f"     动作 move={a.move} shoot={a.shoot} miss={aim['miss']:.1f}")
 
@@ -430,6 +480,79 @@ def main():
         assert m2[0] > -0.5, f"中距离不应一直后退，实际 {a2.move}"
         print(f"     近身 move={a.move}，180px move={a2.move}")
 
+    def t_crowd_escape():
+        # 三只怪从不同方向围上来：不能继续站桩对枪，也不能朝最近的那只走
+        st = mk_state(grid, px, py, enemies=[
+            {"x": px - 60, "y": py, "size": 13},
+            {"x": px + 60, "y": py, "size": 13},
+            {"x": px, "y": py - 70, "size": 13}])
+        ag = TacticalAgent()
+        a = ag.act(st)
+        assert a.mode == "crowd_escape", f"被三面包围应脱离，实际 {a.mode}"
+        assert a.move != (0, 0), "脱离时不能站着"
+        ux, uy = _dir8_to_vec(*a.move)
+        for e in st["entities"][1:]:
+            dx, dy = e["x"] - px, e["y"] - py
+            d = math.hypot(dx, dy)
+            dot = (ux * dx + uy * dy) / d
+            assert dot < 0.6, f"脱离方向正对敌人({e['x']},{e['y']})，实际 {a.move}"
+        assert ag._escape_cost is not None, "撤离应带敌人代价图"
+        print(f"     三面包围 -> {a.mode} {a.move} goal={a.debug.get('goal')}")
+
+    def t_two_chasers_escape():
+        # 左右各一只正在冲过来：还没贴脸也要提前拉开，不能等进 90px
+        st = mk_state(grid, px, py, enemies=[
+            {"x": px - 150, "y": py, "vx": 2.5},
+            {"x": px + 150, "y": py, "vx": -2.5}])
+        ag = TacticalAgent()
+        a = ag.act(st)
+        assert a.mode == "crowd_escape", f"两只冲锋怪应提前脱离，实际 {a.mode}"
+        assert a.debug.get("chasing") == 2, f"追击计数错误 {a.debug}"
+        print(f"     两怪冲锋 -> {a.mode} {a.move} goal={a.debug.get('goal')}")
+
+    def t_escape_path_avoids_enemy():
+        # 目标格在怪的正后方：带代价的寻路不能直接从怪身上穿过去
+        gopen = json.loads(json.dumps(grid))
+        for i in range(gopen["w"] * gopen["h"]):
+            gopen["cells"][i] = 1
+            gopen["coll"][i] = 0
+            gopen["ent"][i] = 0
+        ex, ey = center(gopen, 7, 4)
+        st = mk_state(gopen, *center(gopen, 3, 4), clear=True)
+        ag = TacticalAgent()
+        ag.update_state(st)
+        pidx = ag.grid.idx_of(*center(gopen, 3, 4))
+        goal = ag.grid.idx_of(*center(gopen, 11, 4))
+        n = gopen["w"] * gopen["h"]
+        cost = [0.0] * n
+        for i in range(n):
+            cx, cy = ag.grid.center(i)
+            d = math.hypot(cx - ex, cy - ey)
+            if d < 150:
+                cost[i] = ((150 - d) / 150) ** 2 * 12 + (40.0 if d < 60 else 0.0)
+        path = ag.astar(pidx, goal, extra_cost=cost)
+        assert path, "带代价寻路无解"
+        dmin = min(math.hypot(ag.grid.center(i)[0] - ex,
+                              ag.grid.center(i)[1] - ey) for i in path)
+        assert dmin > 45.0, f"撤离路径穿怪，最近只有 {dmin:.0f}px"
+        print(f"     绕怪路径 {len(path)} 格，最近 {dmin:.0f}px")
+
+    def t_corner_steer():
+        # 紧贴尖刺右下角：朝正上方会被拐角挡住，局部转向必须选一个能走的方向
+        st = mk_state(grid, -31.5, 145.5, clear=True)
+        ag = TacticalAgent()
+        ag.update_state(st)
+        want = (0, -1)
+        assert not ag.grid.grid_segment_clear(
+            -31.5, 145.5, -31.5, 145.5 - 12, radius=10), "测试前提：正上方应被挡住"
+        mv = ag._steer(st["player"], want, -20, 120, look=12)
+        assert mv != want, f"顶住拐角还朝正上走：{mv}"
+        ux, uy = _dir8_to_vec(*mv)
+        assert ag.grid.grid_segment_clear(
+            -31.5, 145.5, -31.5 + ux * 12, 145.5 + uy * 12, radius=10), \
+            f"修正后的方向仍然撞墙：{mv}"
+        print(f"     墙角修正 {want} -> {mv}")
+
     def t_plate_reachable():
         g = json.loads(json.dumps(grid))
         pgx, pgy = 7, 4
@@ -597,6 +720,10 @@ def main():
     ok.append(run_case("回访有未走门的房间补图", t_door_frontier_route))
     ok.append(run_case("大房间第二扇门 slot4-7", t_second_door_slot))
     ok.append(run_case("近身主动拉开距离", t_keep_distance))
+    ok.append(run_case("三面包围：进入脱离模式", t_crowd_escape))
+    ok.append(run_case("两怪冲锋：提前脱离", t_two_chasers_escape))
+    ok.append(run_case("撤离寻路不穿怪", t_escape_path_avoids_enemy))
+    ok.append(run_case("墙角局部转向", t_corner_steer))
     ok.append(run_case("可达压力板：走过去踩", t_plate_reachable))
     ok.append(run_case("压力板被围：炸弹石开路", t_bomb_open_plate))
     ok.append(run_case("没炸弹时报告 plate-blocked", t_bomb_no_stock))

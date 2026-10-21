@@ -21,7 +21,8 @@ try:
 except Exception:
     pass
 
-import multi_instance as mi
+import _bootstrap  # noqa: F401  （补齐仓库根目录）
+from isaac_ai import multi_instance as mi
 
 
 def alive(s):

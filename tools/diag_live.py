@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""diag_live.py —— 接管正在运行的以撒，检查状态/网格映射/按键是否真的生效。
+"""诊断：接管正在运行的以撒，检查状态/网格映射/按键是否真的生效。
 
 用法：
-    python diag_live.py            # 只读取状态
-    python diag_live.py --press    # 依次按住 下/右/上/左 各 1.2 秒，观察速度与位移
-    python diag_live.py --press --focus   # 把游戏切到前台再按键（排查焦点问题）
+    python tools/diag_live.py            # 只读取状态
+    python tools/diag_live.py --press    # 依次按住 下/右/上/左 各 1.2 秒，观察速度与位移
+    python tools/diag_live.py --press --focus   # 把游戏切到前台再按键（排查焦点问题）
 """
 import argparse
 import json
 import math
+import os
 import sys
 import time
 
@@ -17,8 +18,9 @@ try:
 except Exception:
     pass
 
-import multi_instance as mi
-from tactical_agent import RoomGrid
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from isaac_ai import multi_instance as mi  # noqa: E402
+from isaac_ai.tactical_agent import RoomGrid  # noqa: E402
 
 
 def pause(sec):

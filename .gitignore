@@ -1,51 +1,34 @@
-# ===== 大体积数据 / 视频（不要上传到 GitHub）=====
-图形方法的文件/
-runs/
-*.npz
-
 # ===== Python 缓存 / 本地环境 =====
 __pycache__/
 *.py[cod]
 .venv/
-
-# ===== 模型权重（体积大，可重新训练/下载）=====
-*.pt
-*.onnx
-*.pth
 
 # ===== IDE / 系统 =====
 .vscode/
 .DS_Store
 Thumbs.db
 
-# ===== 临时文件 =====
+# ===== 本地运行产物 =====
+logs/
+frames*.json
+savedatapath.txt
 *.log
 *.tmp
-
-
-.png
-# ===== 调试产物 =====
 *.png
-savedatapath.txt
-models/smoke_*
-frames*.json
 
-# ===== 训练产物（体积大，可重训）=====
-models/combat_*.zip
-models/multi_*.zip
-models/bc_*.zip
-models/*_smoke*.zip
-room_catalog_test.json
-
-# ===== turbo 编译产物 =====
-turbo/*.dll
-turbo/*.exe
-turbo/*.log
-turbo/*.png
-turbo_targets.json
+# ===== 模型权重（体积大，不纳入版本库）=====
 models/*.zip
+*.pt
+*.onnx
+*.pth
 
-# 提交消息临时文件
+# ===== 旧 PPO / turbo 采样器编译产物 =====
+legacy/ppo/*.dll
+legacy/ppo/*.exe
+legacy/ppo/turbo_targets.json
+
+# ===== 训练/测试临时文件 =====
+room_catalog_test.json
 .commit_msg.txt
 .cm.txt
 .msg2.txt
@@ -53,7 +36,6 @@ models/*.zip
 .m4.txt
 .m5.txt
 .m6.txt
-logs/
 .m9.txt
 .ma.txt
 .mb.txt

@@ -17,8 +17,9 @@ try:
 except Exception:
     pass
 
+import _bootstrap  # noqa: F401  （补齐仓库根目录）
 import ai_basic_4 as teacher
-import multi_instance as mi
+from isaac_ai import multi_instance as mi
 from isaac_env import normalize_grid
 
 

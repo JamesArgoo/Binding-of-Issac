@@ -100,7 +100,7 @@ def main():
     print("✅ 已复制 main.lua / metadata.xml")
     print("\n接下来：在游戏里 Mods 菜单里把 Isaac AI Bridge 关掉再打开"
           "（或直接重启游戏），新代码才生效。")
-    print("验证：python dump_state.py —— ① 通路状态里应该出现「模组耗时」和更高的实测帧率")
+    print("验证：python tools/diag_live.py —— 应能看到持续更新的状态帧")
     return 0
 
 

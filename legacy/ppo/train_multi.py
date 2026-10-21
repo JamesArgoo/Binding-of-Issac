@@ -31,7 +31,8 @@ try:
 except Exception:
     pass
 
-import multi_instance as mi
+import _bootstrap  # noqa: F401  （补齐仓库根目录）
+from isaac_ai import multi_instance as mi
 from isaac_env import (OBS_DIM, TERRAIN_FULL, TERRAIN_LOCAL, IsaacEnv, obs_dim,
                        terrain_mode_from_dim)
 

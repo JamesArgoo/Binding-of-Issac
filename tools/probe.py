@@ -2,10 +2,11 @@
 """探针：在端口段上听，看游戏模组会不会连上来。用来判断 socket 通路是否正常。
 
 用法：
-    python probe.py              # 听 48532，30 秒
-    python probe.py --port 48533 --seconds 60
+    python tools/probe.py              # 听 48532，30 秒
+    python tools/probe.py --port 48533 --seconds 60
 """
 import argparse
+import os
 import sys
 import time
 
@@ -14,7 +15,8 @@ try:
 except Exception:
     pass
 
-from multi_instance import MultiPortBridge
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from isaac_ai.multi_instance import MultiPortBridge  # noqa: E402
 
 
 def main():
