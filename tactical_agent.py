@@ -36,8 +36,20 @@ SHOOT_DIRS = {1: (0, -1), 2: (1, 0), 3: (0, 1), 4: (-1, 0)}
 PROJECTILE_TYPES = (2, 7, 8, 9)
 WALKABLE_COLL = (0, 5)          # 空地和 WALL_EXCEPT_PLAYER（门）
 BLOCKING_COLL = (2, 3, 4)       # 石头/实心/墙：挡泪弹
-HARMFUL_GRID_ENT = (4, 8)       # 火堆 / 尖刺（GridEntityType）
-TRAPDOOR_GRID_ENT = (10, 11)    # 陷阱门 / 楼梯
+
+# GridEntityType 以游戏 resources/scripts/enums.lua 为准（曾把 4/8/10/11
+# 当成火堆/尖刺/陷阱门，结果 AI 从来认不出陷阱门和压力板）。
+GRID_SPIKES = 8                 # 尖刺
+GRID_SPIKES_ONOFF = 9
+GRID_TNT = 12                   # TNT 桶
+GRID_POOP = 14
+GRID_TRAPDOOR = 17              # 下一层的活板门
+GRID_STAIRS = 18                # 楼梯
+GRID_PRESSURE_PLATE = 20        # 机关房的压力板
+HARMFUL_GRID_ENT = (GRID_SPIKES, GRID_SPIKES_ONOFF)
+# 炸弹能炸掉、且炸掉后可能打通路的地形。TNT 会连锁，单列出来用于避险。
+BOMBABLE_GRID_ENT = (2, 3, 4, 5, 6, 12, 14, 22, 25, 26, 27)
+TRAPDOOR_GRID_ENT = (GRID_TRAPDOOR, GRID_STAIRS)
 
 # Isaac 的 DoorSlot 顺序是 左0 / 上1 / 右2 / 下3（不是上右下左！）
 # 大房间同一侧的第二扇门是 左4 / 上5 / 右6 / 下7。
@@ -164,6 +176,26 @@ class RoomGrid:
     def trapdoor_cells(self) -> list[int]:
         return [i for i, e in enumerate(self.ent) if e in TRAPDOOR_GRID_ENT]
 
+    def pressure_plate_cells(self) -> list[int]:
+        return [i for i, e in enumerate(self.ent) if e == GRID_PRESSURE_PLATE]
+
+    def bombable_idx(self, idx: int) -> bool:
+        return 0 <= idx < len(self.ent) and self.ent[idx] in BOMBABLE_GRID_ENT
+
+    def near_tnt(self, idx: int, cells: float = 1.6) -> bool:
+        """该格是否离 TNT 太近（连锁爆炸避险用）。"""
+        if not (0 <= idx < len(self.ent)):
+            return False
+        gx, gy = idx % self.w, idx // self.w
+        r = int(math.ceil(cells))
+        for y in range(max(0, gy - r), min(self.h, gy + r + 1)):
+            for x in range(max(0, gx - r), min(self.w, gx + r + 1)):
+                if self.ent[y * self.w + x] != GRID_TNT:
+                    continue
+                if math.hypot(x - gx, y - gy) <= cells:
+                    return True
+        return False
+
     def point_clear(self, x: float, y: float, radius: float) -> bool:
         """半径 radius 的圆是否完全落在可走区域内。
 
@@ -275,6 +307,16 @@ class Entity:
     enemy: bool = False
     spawner_type: int = 0
     cdmg: float = 0.0
+    # 高抛弹幕：height 是相对于地面的高度（负数，-23 是普通泪弹的飞行高度）；
+    # 跳跃 BOSS 没有 height，但动画名会给出 JumpUp / JumpDown。
+    height: float = 0.0
+    fall_speed: float = 0.0
+    fall_accel: float = 0.0
+    sprite_off_y: float = 0.0
+    flying: bool = False
+    visible: bool = True
+    invincible: bool = False
+    anim: str = ""
     raw: dict = field(default_factory=dict, repr=False)
 
 
@@ -292,6 +334,14 @@ def _entity(e: dict) -> Entity:
         enemy=bool(e.get("enemy")),
         spawner_type=int(e.get("spawner_type", 0) or 0),
         cdmg=float(e.get("cdmg", 0.0) or 0.0),
+        height=float(e.get("height", 0.0) or 0.0),
+        fall_speed=float(e.get("fall_speed", 0.0) or 0.0),
+        fall_accel=float(e.get("fall_accel", 0.0) or 0.0),
+        sprite_off_y=float(e.get("sprite_off_y", 0.0) or 0.0),
+        flying=bool(e.get("flying")),
+        visible=bool(e.get("visible", 1)),
+        invincible=bool(e.get("invincible")),
+        anim=str(e.get("anim") or ""),
         raw=e,
     )
 
@@ -320,6 +370,7 @@ def split_entities(state: dict) -> tuple[list[Entity], list[Entity], list[Entity
 class Action:
     move: tuple[int, int] = (0, 0)
     shoot: tuple[int, int] = (0, 0)
+    bomb: bool = False
     mode: str = "idle"
     target_id: Optional[int] = None
     aim_dir: int = 0
@@ -328,9 +379,11 @@ class Action:
 
 @dataclass
 class Config:
-    d_opt: float = 108.0
-    d_min: float = 58.0
-    d_far: float = 200.0
+    # 交战距离：太近容易被贴脸，太远泪弹要飞太久且容易脱靶。
+    # 旧值 108 在实机里会一路顶到敌人身上（用户反馈"走到怪脸上"）。
+    d_opt: float = 132.0
+    d_min: float = 84.0
+    d_far: float = 235.0
     horizon: int = 20
     speed_default: float = 3.6
     player_radius: float = 10.0
@@ -343,14 +396,21 @@ class Config:
     # 评分权重
     w_danger: float = 3.0
     w_body: float = 2.0
-    w_distance: float = 1.0
+    w_distance: float = 1.25
     w_align: float = 1.25
     w_los: float = 0.85
     w_open: float = 0.28
     stop_bonus: float = 0.32
     w_aim: float = 1.15          # 移动方向带来的射击机会（含速度补偿）
+    # 近身软威胁：不必等身体重叠，进入这个缓冲就往后撤
+    personal_space: float = 26.0
+    space_penalty: float = 2.2
+    retreat_bonus: float = 0.55
     # 切换目标的滞回
     target_hysteresis: float = 0.35
+    # 机关房炸弹：每隔多久才允许再放一颗（30Hz 决策帧）
+    bomb_cooldown: int = 45
+    bomb_wait: int = 105         # 放完炸弹后撤退/等待爆炸的帧数
 
 
 class TacticalAgent:
@@ -384,6 +444,7 @@ class TacticalAgent:
         self.floor_edges: dict[int, dict[int, int]] = {}
         self.pushed_slot: Optional[int] = None
         self.pushed_from: Optional[int] = None
+        self.prev_room: Optional[int] = None
         self._map_sig: Optional[frozenset[int]] = None
         self.visited_rooms: set[int] = set()
         self.seen_door_slots: dict[int, set[int]] = {}
@@ -391,6 +452,22 @@ class TacticalAgent:
         self.speed_est = self.cfg.speed_default
         self._vel_samples: deque[float] = deque(maxlen=30)
         self.path_age = 0
+        # ---- 机关房 / 炸弹 ----
+        self.bomb_wait = 0            # >0：炸弹已放下，正在撤离/等爆炸
+        self.bomb_cooldown = 0
+        self.bomb_dropped = False
+        self.bomb_target: Optional[int] = None
+        self.bomb_spot: Optional[int] = None
+        self.bomb_escape: Optional[int] = None
+        self.bomb_blacklist: set[int] = set()
+        self.plate_wait = 0
+        self.last_mode = ""
+        # ---- 空中威胁：高抛弹幕的落地预测 + 跳跃 BOSS 的落点预警 ----
+        self._air_prev: dict[int, tuple[float, float, float, float]] = {}
+        self._air_land: dict[int, dict] = {}
+        self._jump_warn: dict[int, dict] = {}
+        self._last_state_frame: Optional[float] = None
+        self._tick = 0
 
     # ------------------------------------------------------------------
     # 状态更新
@@ -401,6 +478,7 @@ class TacticalAgent:
         idx = room.get("index")
         if idx is not None and self.room_index is not None and idx != self.room_index:
             old = self.room_index
+            self.prev_room = old
             # 房号 -3 是每局开局房间；从这里进来说明重开了，楼层记忆作废
             if idx == -3 and old != -3:
                 self.reset_floor()
@@ -425,6 +503,18 @@ class TacticalAgent:
             self.recover_frames = 0
             self.no_los_frames = 0
             self.no_aim_frames = 0
+            self.bomb_wait = 0
+            self.bomb_cooldown = 0
+            self.bomb_dropped = False
+            self.bomb_target = None
+            self.bomb_spot = None
+            self.bomb_escape = None
+            self.bomb_blacklist.clear()
+            self.plate_wait = 0
+            self.last_mode = ""
+            self._air_prev.clear()
+            self._air_land.clear()
+            self._jump_warn.clear()
         self.room_index = idx
         if idx is not None:
             self.visited_rooms.add(idx)
@@ -463,6 +553,7 @@ class TacticalAgent:
         self.seen_door_slots.clear()
         self.pushed_slot = None
         self.pushed_from = None
+        self.prev_room = None
         self.door_push = 0
         self.door_pushing = None
 
@@ -482,6 +573,17 @@ class TacticalAgent:
         self.pickup_wait = 0
         self.door_push = 0
         self.door_pushing = None
+        self.bomb_wait = 0
+        self.bomb_cooldown = 0
+        self.bomb_dropped = False
+        self.bomb_target = None
+        self.bomb_spot = None
+        self.bomb_escape = None
+        self._air_prev.clear()
+        self._air_land.clear()
+        self._jump_warn.clear()
+        self.bomb_blacklist.clear()
+        self.plate_wait = 0
 
     # ------------------------------------------------------------------
     # 弹道
@@ -573,8 +675,11 @@ class TacticalAgent:
             else:
                 s -= 0.6
             s -= 0.012 * max(0.0, e.hp)
-            if d < 48.0:
-                s -= 1.4
+            if d < 72.0:
+                s -= 1.8
+            # 正在跳的 BOSS 会砸向脚下：优先打别的、同时把移动让给躲避
+            if "jump" in (e.anim or "").lower():
+                s -= 1.5
             if e.id == self.last_target_id:
                 s += self.cfg.target_hysteresis
             if s > best_score:
@@ -590,6 +695,157 @@ class TacticalAgent:
     def _bullet_radius(self, b: Entity) -> float:
         return max(4.0, b.size) + self.cfg.player_radius + self.cfg.dodge_margin
 
+    HIGH_AIR_H = -40.0     # 比普通泪弹(-23)明显高：会从头顶飞过，危险在落点
+    NORMAL_H = -23.0       # 普通泪弹/命中判定所在高度
+
+    def _update_air(self, p: dict, enemies: list[Entity],
+                    projectiles: list[Entity], state: dict) -> None:
+        """维护高抛弹幕的落点预测，以及跳跃 BOSS 的落点预警。
+
+        实机采样：Monstro 跳跃时 height 恒为 0、sprite_off_y 也恒为 0，
+        唯一可靠的信号是动画名 JumpUp / JumpDown；它的 Position 就是影子落点。
+        JumpUp 约 0.4 秒，落点锁定玩家当前位置，之后 JumpDown 冲过来。
+        普通泪弹 height=-23；高抛弹幕更负，按高度变化率算落到判定高度的时刻。
+        """
+        self._tick += 1
+        try:
+            frame = float(state.get("frame"))
+        except (TypeError, ValueError):
+            frame = float(self._tick * 2)
+        dt = (frame - self._last_state_frame
+              if self._last_state_frame is not None else 2.0)
+        if dt <= 0 or dt > 30:
+            dt = 2.0
+        self._last_state_frame = frame
+        px, py = float(p["x"]), float(p["y"])
+
+        land: dict[int, dict] = {}
+        for b in projectiles:
+            prev = self._air_prev.get(b.id)
+            self._air_prev[b.id] = (frame, b.height, b.x, b.y)
+            if b.height >= self.HIGH_AIR_H:
+                continue                       # 普通高度：走原来的二维弹道预测
+            if prev is None:
+                # 第一帧还不知道是升是降：在影子附近给一个保守预警
+                land[b.id] = {"x": b.x, "y": b.y, "t": 12.0,
+                              "radius": self._bullet_radius(b) + 12.0}
+                continue
+            df, h0, _, _ = prev
+            ddt = frame - df
+            if ddt <= 0 or ddt > 30:
+                continue
+            dh = (b.height - h0) / ddt          # >0：高度在往地面升
+            if dh <= 0.02:
+                continue                        # 还在上升/平飞，不算落地
+            t_land = (self.NORMAL_H - b.height) / dh
+            if t_land < -4.0 or t_land > 90.0:
+                continue
+            t_land = max(0.0, t_land)
+            land[b.id] = {
+                "x": b.x + b.vx * t_land,
+                "y": b.y + b.vy * t_land,
+                "t": t_land,
+                "radius": self._bullet_radius(b) + 12.0,
+            }
+        # 每次重建：弹幕落地/消失后预警必须立刻撤销，否则会在空地上多躲两秒
+        self._air_land = land
+        alive = {b.id for b in projectiles}
+        for k in list(self._air_prev):
+            if k not in alive:
+                del self._air_prev[k]
+
+        warns: dict[int, dict] = {}
+        for e in enemies:
+            anim = (e.anim or "").lower()
+            if "jump" not in anim:
+                continue
+            dist = math.hypot(e.x - px, e.y - py)
+            if dist > 420.0:
+                continue
+            if "up" in anim:
+                # 起跳蓄力：落地时几乎就在玩家脚下，立刻开始横移
+                lx, ly, t_land = px, py, 12.0
+            elif "down" in anim:
+                # 下落：影子 = Position，按当前水平速度再前推几帧
+                lx, ly, t_land = e.x + e.vx * 8.0, e.y + e.vy * 8.0, 6.0
+            else:
+                ux = (px - e.x) / dist if dist > 1 else 0.0
+                uy = (py - e.y) / dist if dist > 1 else 0.0
+                lx = e.x + ux * min(dist, e.size * 3.0)
+                ly = e.y + uy * min(dist, e.size * 3.0)
+                t_land = 10.0
+            warns[e.id] = {
+                "x": lx, "y": ly, "t": t_land, "ttl": 24, "anim": anim,
+                "radius": max(20.0, e.size + self.cfg.player_radius + 16.0),
+            }
+        self._jump_warn = warns
+
+    def _jump_dodge_dir(self, p: dict, enemies: list[Entity]) -> Optional[tuple[int, int]]:
+        """跳跃 BOSS 的专用躲避方向：远离落点/身体，优先往开阔处跑。
+
+        通用 plan_move 的“靠近到 d_opt / 对齐射击”权重会在起跳瞬间把 AI
+        推向 BOSS 身上（实机：JumpUp 时向右走）。这里在跳跃窗口内直接接管移动。
+        """
+        if not self._jump_warn or self.grid is None:
+            return None
+        grid = self.grid
+        px, py = float(p["x"]), float(p["y"])
+        active = []
+        for e in enemies:
+            anim = (e.anim or "").lower()
+            if "jump" not in anim:
+                continue
+            j = self._jump_warn.get(e.id)
+            if j is None:
+                continue
+            d_boss = math.hypot(e.x - px, e.y - py)
+            if d_boss > 360.0:
+                continue
+            # 下落阶段且落点还远时不用放弃输出；起跳阶段必须立刻动
+            if ("up" not in anim
+                    and math.hypot(j["x"] - px, j["y"] - py) > j["radius"] + 110.0
+                    and d_boss > 160.0):
+                continue
+            active.append((e, j))
+        if not active:
+            return None
+        clearance = grid.clearance()
+        speed = self.speed_est
+        best = None
+        for mx, my in DIRS8:
+            ux, uy = _dir8_to_vec(mx, my)
+            reach = 8.0
+            sx = sy = 0.0
+            for reach in (8.0, 4.0, 2.5):
+                sx, sy = px + ux * speed * reach, py + uy * speed * reach
+                if (grid.idx_of(sx, sy) >= 0
+                        and grid.point_clear(sx, sy, self.cfg.wall_radius)):
+                    break
+            else:
+                continue
+            score = 0.0
+            for e, j in active:
+                d0 = math.hypot(j["x"] - px, j["y"] - py)
+                d1 = math.hypot(j["x"] - sx, j["y"] - sy)
+                score += (d1 - d0) * 2.2
+                bx, by = e.x + e.vx * reach, e.y + e.vy * reach
+                score += min(80.0, math.hypot(bx - sx, by - sy)) * 0.03
+                # 明确禁止“朝 BOSS 身上跑”：起跳落点就在脚下时，
+                # 远离落点和靠近 BOSS 在几何上是同一个方向，必须拆开。
+                db = math.hypot(e.x - px, e.y - py)
+                if db > 1.0:
+                    toward = (ux * (e.x - px) + uy * (e.y - py)) / db
+                    if toward > 0:
+                        score -= toward * 1.5
+            idx = grid.idx_of(sx, sy)
+            if idx >= 0:
+                score += min(clearance[idx], 80.0) / 80.0 * 0.8
+            if self.last_move == (mx, my):
+                score += 0.12
+            if best is None or score > best[0]:
+                best = (score, (mx, my))
+        return best[1] if best is not None else None
+
     def _threat_now(self, p: dict, projectiles: list[Entity], enemies: list[Entity],
                     hazards: list[Entity]) -> float:
         """当前是否已经在威胁里（用于进入紧急躲避模式）。"""
@@ -597,6 +853,14 @@ class TacticalAgent:
         level = 0.0
         for b in projectiles:
             rr = self._bullet_radius(b)
+            if b.height < self.HIGH_AIR_H:
+                # 高抛弹幕此刻在头顶，只有快落地且落点在脚下才算威胁
+                land = self._air_land.get(b.id)
+                if (land is not None and land["t"] <= 10.0
+                        and math.hypot(land["x"] - px, land["y"] - py)
+                        < land["radius"] + 6.0):
+                    level = max(level, 0.95)
+                continue
             dist = math.hypot(b.x - px, b.y - py)
             if dist <= rr:
                 level = max(level, 1.0)
@@ -616,6 +880,10 @@ class TacticalAgent:
             dist = math.hypot(e.x - px, e.y - py)
             if dist < rr:
                 level = max(level, 0.8)
+        # 跳跃 BOSS 还没落地，但落点已经压过来了：比贴身更急
+        for j in self._jump_warn.values():
+            if math.hypot(j["x"] - px, j["y"] - py) < j["radius"] + 10.0:
+                level = max(level, 0.95 if "down" in j["anim"] else 0.8)
         for hz in hazards:
             if math.hypot(hz.x - px, hz.y - py) < hz.size + self.cfg.player_radius + 6:
                 level = max(level, 0.6)
@@ -628,6 +896,20 @@ class TacticalAgent:
         danger = 0.0
         urgency = 1.0 + max(0.0, 1.0 - t / max(1.0, self.cfg.horizon)) * 1.5
         for b in projectiles:
+            if b.height < self.HIGH_AIR_H:
+                # 高抛：当前高度过顶，不该按二维轨迹躲；危险聚在落地时刻的落点
+                land = self._air_land.get(b.id)
+                if land is None:
+                    continue
+                rr = land["radius"]
+                d = math.hypot(land["x"] - x, land["y"] - y)
+                if d < rr:
+                    lead = land["t"] - t
+                    w = 1.0 if lead <= 6.0 else max(0.12, 1.0 - lead / 30.0)
+                    danger += (rr - d + 2.0) * 5.0 * urgency * w
+                    if lead <= 6.0 and d < rr * 0.55:
+                        danger += 45.0 * urgency
+                continue
             bx, by = b.x + b.vx * t, b.y + b.vy * t
             rr = self._bullet_radius(b)
             d = math.hypot(bx - x, by - y)
@@ -643,6 +925,20 @@ class TacticalAgent:
             d = math.hypot(ex - x, ey - y)
             if d < rr:
                 danger += (rr - d + 2.0) * 3.5 * urgency
+            # 贴身软威胁：身体还没碰上，但已经进入"再走两步就撞"的缓冲。
+            # 只靠 rr 时，AI 会一路追到几乎重叠才觉得危险 —— 实机看起来就像
+            # 往怪脸上走。这个场让它在 d_min 附近就主动保持距离。
+            soft = e.size + self.cfg.player_radius + self.cfg.personal_space
+            if d < soft:
+                danger += (soft - d + 2.0) * self.cfg.space_penalty * urgency
+        # 跳跃 BOSS：预警圈画在落点上，AI 在起跳蓄力时就开始横移
+        for j in self._jump_warn.values():
+            rr = j["radius"]
+            d = math.hypot(j["x"] - x, j["y"] - y)
+            if d < rr:
+                danger += (rr - d + 2.0) * 6.0 * urgency
+                if d < rr * 0.55:
+                    danger += 60.0 * urgency
         for hz in hazards:
             rr = hz.size + self.cfg.player_radius + 3
             d = math.hypot(hz.x - x, hz.y - y)
@@ -678,6 +974,8 @@ class TacticalAgent:
         clearance = grid.clearance()
         vpx = float(p.get("vx", 0) or 0.0)
         vpy = float(p.get("vy", 0) or 0.0)
+        cur_d = (math.hypot(target.x - px, target.y - py)
+                 if target is not None else 0.0)
         for mx, my in DIRS8 + [(0, 0)]:
             ux, uy = _dir8_to_vec(mx, my)
             score = 0.0
@@ -699,7 +997,11 @@ class TacticalAgent:
             # 这个方向没用。旧版对 18 帧内任何时刻撞墙都扣 -900，结果靠墙时
             # 几乎所有方向都被淘汰，AI 只剩站桩可选（实测靠下墙时完全不动）。
             if blocked_at is not None and blocked_at <= 2:
-                score -= 1.6
+                # 正对墙的方向几乎没有位移，不能因为“远离 BOSS”的评分被选中。
+                # 实机踩过：被 BOSS 逼到墙角时还一直往墙里推，结果贴脸挨打。
+                score -= 4.0 if blocked_at <= 1 else 2.6
+            elif blocked_at is not None and blocked_at <= 4:
+                score -= 0.6
             # 评估点：能走多远就评多远，绝不用墙里的位置去算对齐/开阔度
             mid_t = obs_times[len(obs_times) // 2]
             eval_t = mid_t if blocked_at is None else min(mid_t, max(1, blocked_at - 1))
@@ -729,7 +1031,14 @@ class TacticalAgent:
                 if d > self.cfg.d_far:
                     score -= 1.4 * (d - self.cfg.d_far) / 50.0
                 if d < self.cfg.d_min:
-                    score -= 1.8 * (self.cfg.d_min - d) / 30.0
+                    gap = (self.cfg.d_min - d) / self.cfg.d_min
+                    # 非线性：贴得越近罚得越狠，避免用"稍微退一点"骗过线性项
+                    score -= self.cfg.space_penalty * (gap ** 1.5) * 4.0
+                    # 已经在危险距离内：明确奖励把距离拉开的移动，
+                    # 否则"边退边少打一枪"会被 w_aim 的收益压过去。
+                    if d > cur_d:
+                        score += self.cfg.retreat_bonus * min(
+                            1.0, (self.cfg.d_min - cur_d) / self.cfg.d_min + 0.3)
                 # 对齐：减少非射击轴偏移
                 axis, off = self._align_offset(mxp, myp, tx, ty)
                 score -= self.cfg.w_align * off / 42.0
@@ -758,6 +1067,10 @@ class TacticalAgent:
             if idx >= 0:
                 cl = clearance[idx]
                 score += self.cfg.w_open * min(cl, 90.0) / 90.0
+                # 近身时更看重“有地方退”：墙角只有两个方向可走，
+                # 被快速 BOSS 贴上来就无路可逃。开阔度权重临时加倍。
+                if target is not None and cur_d < self.cfg.d_min * 1.25:
+                    score += 0.85 * min(cl, 90.0) / 90.0
                 if cl < self.cfg.wall_radius + 4:
                     score -= 0.55
             # 连续性（轻微，避免 30Hz 抖动）
@@ -876,24 +1189,54 @@ class TacticalAgent:
     # ------------------------------------------------------------------
     # 门/探索/拾取
     # ------------------------------------------------------------------
-    def _map_step_toward(self, goal_pred) -> Optional[int]:
-        """在“已经走过的门”构成的连通图上 BFS。
+    def _known_edges(self) -> dict[int, dict[int, int]]:
+        """当前已知的楼层连通图：走过的边 + 见过的开着的门推断出的边。
 
-        不能用 13x13 格子相邻来推断连通性 —— 实测房间 84 的正上方格子是
-        72，但 84 的上门其实通到 71，而 85 的上门是锁着的。按格子 BFS
-        会得出 84→85→72 这种根本不存在的路，AI 就在两间房之间反复弹。
+        只用地图里真实存在的房间和房间内真实开着的门，所以不会像
+        “13x13 格子相邻”那样凭空造出不存在的通房路。推断边很重要：
+        实机里 AI 往往只走过 84→97，却在 97 看到下门通往未探索的 110；
+        只靠走过的边，它不知道 97 能继续往下，就会在两间已清房之间弹。
         """
+        rooms = {int(r.get("grid", 0)) for r in self.map_rooms}
+        graph: dict[int, dict[int, int]] = {}
+
+        def add(r: int, slot: int) -> None:
+            delta = ROOM_DELTA.get(int(slot))
+            if delta is None:
+                return
+            nr = r + delta
+            if nr in rooms:
+                graph.setdefault(r, {})[int(slot)] = nr
+
+        for r, slots in self.seen_door_slots.items():
+            for slot in slots:
+                add(int(r), int(slot))
+        # 真实走过的边最可信：最后写入，按记录的目标房号，不做几何重推
+        # （异常房/楼层重置后房号可能不满足 13 宽相邻，重推会把边接到错误房间）
+        for r, slots in self.floor_edges.items():
+            for slot, nr in slots.items():
+                if int(nr) in rooms:
+                    graph.setdefault(int(r), {})[int(slot)] = int(nr)
+        if self.room_index is not None:
+            for d in self.doors:
+                if d.get("open"):
+                    add(self.room_index, int(d.get("slot", -1)))
+        return graph
+
+    def _map_step_toward(self, goal_pred) -> Optional[int]:
+        """在已知楼层连通图上 BFS，返回从当前房间出发的第一跳。"""
         rooms = {int(r.get("grid", 0)): r for r in self.map_rooms}
         cur = self.room_index
         if cur is None or cur not in rooms:
             return None
+        graph = self._known_edges()
         q = deque([cur])
         first = {cur: None}
         while q:
             r = q.popleft()
             if r != cur and goal_pred(rooms.get(r, {})):
                 return first.get(r)
-            for slot, nr in self.floor_edges.get(r, {}).items():
+            for slot, nr in graph.get(r, {}).items():
                 if nr in rooms and nr not in first:
                     first[nr] = nr if r == cur else first[r]
                     q.append(nr)
@@ -981,13 +1324,18 @@ class TacticalAgent:
         known = self.floor_edges.get(self.room_index, {})
         unknown = [d for d in open_doors
                    if int(d.get("slot", -1)) not in known]
+
+        def fallback_key(d: dict):
+            nr = self._door_neighbor(d)
+            # 刚从这个房间出来：没有别的选择时再回去，避免 84↔83 来回踱步
+            return (1 if nr == self.prev_room else 0,
+                    vm.get(nr, 0), int(d.get("slot", 9)))
+
         if unknown:
-            return min(unknown, key=lambda d: (
-                vm.get(self._door_neighbor(d), 0), int(d.get("slot", 9))))
+            return min(unknown, key=fallback_key)
 
         # 6) 都走过了：挑去得最少的门
-        return min(open_doors, key=lambda d: (
-            vm.get(self._door_neighbor(d), 0), int(d.get("slot", 9))))
+        return min(open_doors, key=fallback_key)
 
     def _pickup_target(self, p: dict, pickups: list[Entity]) -> Optional[Entity]:
         if not pickups or self.grid is None:
@@ -1004,6 +1352,269 @@ class TacticalAgent:
         return min(cand, key=lambda e: math.hypot(e.x - px, e.y - py))
 
     # ------------------------------------------------------------------
+    # 机关房：压力板 / 炸弹开路
+    # ------------------------------------------------------------------
+    def _reachable(self, p: dict) -> dict[int, int]:
+        """从玩家出发、只走可走格的 BFS，返回 {格号: 步数}。
+
+        只用 4 邻域：炸弹开路需要的是“人能不能走到”，不是 A* 的平滑路径。
+        允许穿过尖刺格（真正走路时 A* 会因危险代价尽量绕开）。
+        """
+        grid = self.grid
+        out: dict[int, int] = {}
+        if grid is None:
+            return out
+        start = grid.idx_of(float(p["x"]), float(p["y"]))
+        if start < 0:
+            return out
+        if not grid.walkable_idx(start):
+            gx, gy = start % grid.w, start // grid.w
+            cand = [i for i in (gy * grid.w + gx + dy * grid.w + dx
+                                for dx, dy in DIRS8)
+                    if 0 <= i < grid.w * grid.h and grid.walkable_idx(i)]
+            if not cand:
+                return out
+            start = min(cand, key=lambda i: (i % grid.w - gx) ** 2
+                        + (i // grid.w - gy) ** 2)
+        out[start] = 0
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            cx, cy = cur % grid.w, cur // grid.w
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < grid.w and 0 <= ny < grid.h):
+                    continue
+                ni = ny * grid.w + nx
+                if ni not in out and grid.walkable_idx(ni):
+                    out[ni] = out[cur] + 1
+                    q.append(ni)
+        return out
+
+    def _bomb_escape_cell(self, p: dict, spot: int) -> Optional[int]:
+        """放完炸弹后往哪撤：离爆点够远，并避开 TNT 连锁与尖刺。"""
+        grid = self.grid
+        if grid is None:
+            return None
+        reach = self._reachable(p)
+        if not reach:
+            return None
+        bx, by = grid.center(spot)
+        tile = min(grid.tw, grid.th)
+        safe = 3.0 * tile                       # 爆炸半径 + 玩家身位余量
+        # 炸弹石旁边如果有 TNT，会连锁；每个被引爆的 TNT 都是新的爆心。
+        centers = [(bx, by)]
+        for i, e in enumerate(grid.ent):
+            if e != GRID_TNT:
+                continue
+            tx, ty = grid.center(i)
+            if math.hypot(tx - bx, ty - by) <= safe * 1.2:
+                centers.append((tx, ty))
+        cl = grid.clearance()
+        best, best_score = None, -1e18
+        for idx, steps in reach.items():
+            if idx == spot:
+                continue
+            wx, wy = grid.center(idx)
+            db = min(math.hypot(wx - cx, wy - cy) for cx, cy in centers)
+            if db < safe:
+                continue                        # 还在爆炸半径里（含连锁）
+            score = min(db, 4.6 * tile) * 0.5 - steps * 0.16
+            score += min(cl[idx], 70.0) * 0.015
+            if grid.hazardous_idx(idx):
+                score -= 4.0 * tile
+            if grid.near_tnt(idx, 2.2):
+                score -= 3.0 * tile             # TNT 连锁可能比普通炸弹更远
+            if score > best_score:
+                best, best_score = idx, score
+        if best is not None:
+            return best
+        # 实在没有安全点：选离所有爆心最远的可走格
+        return max(reach, key=lambda i: min(
+            math.hypot(grid.center(i)[0] - cx, grid.center(i)[1] - cy)
+            for cx, cy in centers))
+
+    def _choose_bomb_plan(self, p: dict, targets: set[int]) -> Optional[int]:
+        """挑一块值得炸的地形，返回放炸弹时应该站的可走格。
+
+        条件：站在可达格上，紧挨着一块炸弹能破坏的格子，且那块格子后面
+        至少有一格“还没连通的空地”。这样炸开才算扩大活动范围，不会为了
+        装饰性石头浪费炸弹。
+        """
+        grid = self.grid
+        if grid is None or not targets:
+            return None
+        try:
+            bombs = int(float(p.get("bombs", 0) or 0))
+        except (TypeError, ValueError):
+            bombs = 0
+        if bombs <= 0 or self.bomb_cooldown > 0:
+            return None
+        reach = self._reachable(p)
+        if not reach:
+            return None
+        tile = min(grid.tw, grid.th)
+        best_o, best_s, best_score = None, None, 1e18
+        for o, ent in enumerate(grid.ent):
+            if o in self.bomb_blacklist or ent not in BOMBABLE_GRID_ENT:
+                continue
+            ox, oy = o % grid.w, o // grid.w
+            spots = []
+            for dx, dy in DIRS8:
+                nx, ny = ox + dx, oy + dy
+                if 0 <= nx < grid.w and 0 <= ny < grid.h:
+                    ni = ny * grid.w + nx
+                    if ni in reach:
+                        spots.append(ni)
+            if not spots:
+                continue
+            # 炸开后必须能进入新的空地（否则只是在清装饰）
+            opens = False
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = ox + dx, oy + dy
+                if 0 <= nx < grid.w and 0 <= ny < grid.h:
+                    ni = ny * grid.w + nx
+                    if ni not in reach and grid.walkable_idx(ni):
+                        opens = True
+                        break
+            if not opens:
+                continue
+            spot = min(spots, key=lambda i: reach[i])
+            goal_d = min(abs(ox - t % grid.w) + abs(oy - t // grid.w)
+                         for t in targets)
+            score = reach[spot] * 1.0 + goal_d * 0.9
+            if ent == 5:                            # 炸弹石会连锁，优先
+                score -= 0.7
+            if ent == GRID_TNT:                     # TNT 伤害高，次选
+                score += 2.5
+            if grid.near_tnt(spot, 1.6):
+                score += 5.0                        # 别站在别的 TNT 旁边放
+            if grid.hazardous_idx(spot):
+                score += 4.0
+            # 同分时优先离玩家近
+            score += 0.01 * math.hypot(*[a - b for a, b in zip(
+                grid.center(spot), (float(p["x"]), float(p["y"])))]) / tile
+            if score < best_score:
+                best_o, best_s, best_score = o, spot, score
+        if best_o is None:
+            return None
+        self.bomb_target = best_o
+        self.bomb_spot = best_s
+        self.bomb_escape = None
+        self.bomb_dropped = False
+        self.bomb_wait = 0
+        return best_s
+
+    def _run_bomb_sequence(self, p: dict) -> Optional[Action]:
+        """执行“走到炸点→放 E→撤到安全处→等爆炸”的状态机。"""
+        grid = self.grid
+        if grid is None or self.bomb_target is None:
+            return None
+        px, py = float(p["x"]), float(p["y"])
+        if self.bomb_dropped:
+            if self.bomb_wait <= 0:
+                # 炸完清账：目标还在说明没炸到/没炸开，别再试同一块
+                if grid.bombable_idx(self.bomb_target):
+                    self.bomb_blacklist.add(self.bomb_target)
+                self.bomb_target = None
+                self.bomb_spot = None
+                self.bomb_escape = None
+                self.bomb_dropped = False
+                self.bomb_cooldown = self.cfg.bomb_cooldown
+                return None
+            if self.bomb_escape is not None:
+                nav = self._follow_path(p, self.bomb_escape, radius=6.0)
+                if nav is not None and nav != (0, 0):
+                    self.last_move = nav
+                    return Action(move=nav, mode="bomb",
+                                  debug={"bomb_wait": self.bomb_wait})
+            self.last_move = (0, 0)
+            return Action(mode="bomb", debug={"bomb_wait": self.bomb_wait})
+
+        spot = self.bomb_spot
+        if spot is None:
+            self.bomb_target = None
+            return None
+        cx, cy = grid.center(spot)
+        if math.hypot(px - cx, py - cy) < 12.0:
+            self.bomb_escape = self._bomb_escape_cell(p, spot)
+            self.bomb_dropped = True
+            self.bomb_wait = self.cfg.bomb_wait
+            mv = (0, 0)
+            if self.bomb_escape is not None:
+                ex, ey = grid.center(self.bomb_escape)
+                mv = _vec_to_dir8(ex - px, ey - py)
+            self.last_move = mv
+            return Action(move=mv, bomb=True, mode="bomb",
+                          debug={"bomb": self.bomb_target})
+        nav = self._follow_path(p, spot, radius=5.0)
+        if nav is None:
+            self.bomb_blacklist.add(self.bomb_target)
+            self.bomb_target = None
+            self.bomb_spot = None
+            self.bomb_cooldown = self.cfg.bomb_cooldown
+            return None
+        self.last_move = nav
+        return Action(move=nav, mode="bomb", debug={"bomb": self.bomb_target})
+
+    def _handle_mechanism(self, p: dict) -> Optional[Action]:
+        """无敌人但未清房：踩压力板；踩不到就炸开一条路。"""
+        grid = self.grid
+        if grid is None:
+            return None
+        px, py = float(p["x"]), float(p["y"])
+        plates = grid.pressure_plate_cells()
+        if plates:
+            reach = self._reachable(p)
+            pidx = grid.idx_of(px, py)
+            if pidx in plates:
+                # 站在板上：机关房会在这一帧清房，别乱动
+                self.plate_wait += 1
+                self.last_move = (0, 0)
+                return Action(mode="plate", debug={"plate": pidx})
+            usable = [i for i in plates if i in reach]
+            if usable:
+                goal = min(usable, key=lambda i: reach[i])
+                cx, cy = grid.center(goal)
+                if math.hypot(px - cx, py - cy) < 12.0:
+                    self.plate_wait += 1
+                    self.last_move = (0, 0)
+                    return Action(mode="plate", debug={"plate": goal})
+                nav = self._follow_path(p, goal, radius=5.0)
+                if nav is not None:
+                    self.last_move = nav
+                    return Action(move=nav, mode="plate",
+                                  debug={"plate": goal})
+            else:
+                spot = self._choose_bomb_plan(p, set(plates))
+                if spot is not None:
+                    nav = self._follow_path(p, spot, radius=5.0)
+                    if nav is not None:
+                        self.last_move = nav
+                        return Action(move=nav, mode="bomb",
+                                      debug={"bomb_plan": self.bomb_target})
+            self.last_move = (0, 0)
+            return Action(mode="plate-blocked",
+                          debug={"plates": plates[:2]})
+
+        # 没有压力板：至少别被“可炸障碍挡在开门路线上”卡死
+        open_targets = {int(d.get("grid", -1)) for d in self.doors
+                        if d.get("open")}
+        open_targets = {i for i in open_targets
+                        if 0 <= i < grid.w * grid.h}
+        if open_targets:
+            reach = self._reachable(p)
+            if not any(i in reach for i in open_targets):
+                spot = self._choose_bomb_plan(p, open_targets)
+                if spot is not None:
+                    nav = self._follow_path(p, spot, radius=5.0)
+                    if nav is not None:
+                        self.last_move = nav
+                        return Action(move=nav, mode="bomb",
+                                      debug={"bomb_plan": self.bomb_target})
+        return None
+
+    # ------------------------------------------------------------------
     # 主决策
     # ------------------------------------------------------------------
     def act(self, state: dict) -> Action:
@@ -1012,8 +1623,13 @@ class TacticalAgent:
         self.update_state(state)
         if not p or (float(p.get("hp", 0) or 0) + float(p.get("soul_hp", 0) or 0)) <= 0:
             return Action(mode="dead")
+        if self.bomb_cooldown > 0:
+            self.bomb_cooldown -= 1
+        if self.bomb_wait > 0:
+            self.bomb_wait -= 1
         px, py = float(p["x"]), float(p["y"])
         enemies, projectiles, pickups, hazards = split_entities(state)
+        self._update_air(p, enemies, projectiles, state)
         grid = self.grid
         if grid is None:
             return Action(mode="no-grid")
@@ -1039,9 +1655,12 @@ class TacticalAgent:
             cx = grid.ox + grid.w * grid.tw / 2
             cy = grid.oy + grid.h * grid.th / 2
             self.recover_dir = _vec_to_dir8(cx - px, cy - py)
-        if self.recover_frames > 0:
+        if self.recover_frames > 0 and not self._jump_warn:
             self.recover_frames -= 1
             return Action(move=self.recover_dir, mode="recover")
+        if self._jump_warn:
+            # 跳跃砸地时不能再执行“回房间中心”，否则正好撞在落点上
+            self.recover_frames = 0
 
         # ---- 战斗 ----
         if enemies and not room.get("clear"):
@@ -1069,6 +1688,21 @@ class TacticalAgent:
 
             # 如果已经在挨打，先躲，不开枪（少一发射击不影响生存）
             threat = self._threat_now(p, projectiles, enemies, hazards)
+            # 跳跃 BOSS：直接接管移动。只靠通用评分会在起跳时为了对齐/射程
+            # 往 BOSS 方向挪，实机就是这样被砸中的。
+            if self._jump_warn:
+                jd = self._jump_dodge_dir(p, enemies)
+                if jd is not None:
+                    self.last_move = jd
+                    self.last_shoot = (0, 0)
+                    return Action(
+                        move=jd, shoot=(0, 0), mode="jump_dodge",
+                        target_id=target.id if target else None,
+                        debug={**detail, "threat": max(threat, 0.95),
+                               "jump": True,
+                               "jump_land": [(round(j["x"]), round(j["y"]))
+                                             for j in self._jump_warn.values()],
+                               "target": (target.x, target.y) if target else None})
             shoot = SHOOT_DIRS[aim["dir"]] if (aim is not None and threat < 0.65) else (0, 0)
             if aim is not None and threat >= 0.65:
                 aim = None
@@ -1077,13 +1711,27 @@ class TacticalAgent:
             if aim is None and self.no_aim_frames > 24 and target is not None:
                 spots = self._engage_spots(target)
                 if spots:
-                    goal = min(spots, key=lambda i: (i % grid.w - grid.idx_of(px, py) % grid.w) ** 2
-                               + (i // grid.w - grid.idx_of(px, py) // grid.w) ** 2)
-                    nav = self._follow_path(p, goal, radius=7.0)
-                    if nav is not None and nav != (0, 0):
-                        move = nav
-                        detail["reposition"] = True
-                        self.no_aim_frames = 0
+                    pidx = grid.idx_of(px, py)
+                    best = None
+                    for i in spots:
+                        path = self.astar(pidx, i)
+                        if path is not None and (best is None
+                                                 or len(path) < best[0]):
+                            best = (len(path), i)
+                    if best is not None:
+                        nav = self._follow_path(p, best[1], radius=7.0)
+                        if nav is not None and nav != (0, 0):
+                            move = nav
+                            detail["reposition"] = True
+                            # 注意：这里不能把 no_aim_frames 清零。
+                            # 清掉后下一帧又回到 plan_move，走一步就被拉回原位，
+                            # 实机表现为在石头墙外左右横跳、永远绕不进去。
+                            self.last_move = move
+                            self.last_shoot = (0, 0)
+                            return Action(move=move, shoot=(0, 0),
+                                          mode="reposition",
+                                          target_id=target.id,
+                                          debug=detail)
             self.last_move = move
             self.last_shoot = shoot
             return Action(move=move, shoot=shoot, mode="combat",
@@ -1092,7 +1740,23 @@ class TacticalAgent:
                           debug={**detail, "target": (target.x, target.y) if target else None,
                                  "aim_miss": aim["miss"] if aim else None,
                                  "threat": threat,
+                                 "jump_land": [(round(j["x"]), round(j["y"]))
+                                               for j in self._jump_warn.values()] or None,
                                  "speed": self.speed_est})
+
+        # ---- 机关房炸弹：放完弹先撤，爆炸后再重新规划 ----
+        if not enemies:
+            # 房间已经因别的原因清空：放弃还没放下的炸路计划（别浪费炸弹），
+            # 但已经放下的仍要等爆炸/撤离，不能立刻冲进爆区。
+            if (room.get("clear") and self.bomb_target is not None
+                    and not self.bomb_dropped):
+                self.bomb_target = None
+                self.bomb_spot = None
+                self.bomb_escape = None
+                self.bomb_wait = 0
+            bomb_action = self._run_bomb_sequence(p)
+            if bomb_action is not None:
+                return bomb_action
 
         # ---- 清房后的拾取/开门 ----
         if room.get("clear"):
@@ -1159,10 +1823,21 @@ class TacticalAgent:
                     if nav is not None:
                         self.last_move = nav
                         return Action(move=nav, mode="door", debug={"door": dg})
+                    # 门口被石头/炸药桶堵死：炸开再过去
+                    spot = self._choose_bomb_plan(p, {dg})
+                    if spot is not None:
+                        nav = self._follow_path(p, spot, radius=5.0)
+                        if nav is not None:
+                            self.last_move = nav
+                            return Action(move=nav, mode="bomb",
+                                          debug={"bomb_plan": self.bomb_target})
             self.last_move = (0, 0)
             return Action(mode="idle")
 
-        # 有敌人但房间标记清空（过渡帧）
+        # 无敌人但也没清房：机关房（压力板 / 炸药桶 / 被石头堵路）
+        mech = self._handle_mechanism(p)
+        if mech is not None:
+            return mech
         self.last_move = (0, 0)
         return Action(mode="idle")
 

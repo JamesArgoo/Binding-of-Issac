@@ -15,30 +15,39 @@ except Exception:
 
 import isaac_data as D
 from tactical_agent import (Config, TacticalAgent, RoomGrid, DIRS8,
-                            SHOOT_DIRS, ROOM_DELTA, _dir8_to_vec)
+                            SHOOT_DIRS, ROOM_DELTA, _dir8_to_vec, split_entities)
 
 
 def mk_state(grid, px, py, enemies=(), bullets=(), pickups=(), clear=False,
-             room_index=50, player_v=(0.0, 0.0), hp=6.0, doors=None):
+             room_index=50, player_v=(0.0, 0.0), hp=6.0, doors=None, bombs=3):
     ent = [{
         "id": 1, "type": 1, "variant": 0, "x": px, "y": py,
         "vx": player_v[0], "vy": player_v[1], "hp": hp, "enemy": False,
         "boss": False, "spawner_type": 0, "size": 10.0, "cdmg": 0.0,
     }]
     for i, e in enumerate(enemies):
-        ent.append({
+        rec = {
             "id": 100 + i, "type": int(e.get("type", 10)), "variant": 0,
             "x": e["x"], "y": e["y"], "vx": e.get("vx", 0.0), "vy": e.get("vy", 0.0),
-            "hp": e.get("hp", 10.0), "enemy": True, "boss": False,
+            "hp": e.get("hp", 10.0), "enemy": True, "boss": bool(e.get("boss")),
             "spawner_type": 0, "size": e.get("size", 13.0), "cdmg": e.get("cdmg", 1.0),
-        })
+        }
+        for k in ("anim", "height", "fall_speed", "fall_accel", "sprite_off_y",
+                  "flying", "visible", "invincible"):
+            if k in e:
+                rec[k] = e[k]
+        ent.append(rec)
     for i, b in enumerate(bullets):
-        ent.append({
+        rec = {
             "id": 300 + i, "type": 2, "variant": 0,
             "x": b["x"], "y": b["y"], "vx": b.get("vx", 0.0), "vy": b.get("vy", 0.0),
             "hp": 0.0, "enemy": False, "boss": False,
             "spawner_type": 0, "size": b.get("size", 5.0), "cdmg": b.get("cdmg", 0.0),
-        })
+        }
+        for k in ("height", "fall_speed", "fall_accel"):
+            if k in b:
+                rec[k] = b[k]
+        ent.append(rec)
     for i, pk in enumerate(pickups):
         ent.append({
             "id": 500 + i, "type": 5, "variant": pk.get("variant", 10),
@@ -54,6 +63,7 @@ def mk_state(grid, px, py, enemies=(), bullets=(), pickups=(), clear=False,
             "damage": 3.5, "move_speed": 1.0, "tear_range": 260.0,
             "shot_speed": 1.0, "fire_delay": 8.0, "size": 10.0,
             "grid_idx": 0, "fire_dir": -1, "head_dir": 3, "iframes": 0,
+            "bombs": bombs,
         },
         "room": {"type": 1, "index": room_index, "enemies_alive": len(enemies),
                  "bosses_alive": 0, "clear": clear},
@@ -72,6 +82,46 @@ def mk_state(grid, px, py, enemies=(), bullets=(), pickups=(), clear=False,
 
 def center(g, gx, gy):
     return g["ox"] + (gx + 0.5) * g["tw"], g["oy"] + (gy + 0.5) * g["th"]
+
+
+def mech_grid(plate=(7, 4), bombable=(6, 4), tnt=()):
+    """复刻实机房间 73：压力板被一圈石头围死，其中一块是炸弹石。
+
+    bombable 里的格子用 ent=5（炸弹石），tnt 里的用 ent=12；其余围一圈
+    ent=2 的石头。压力板本身可走（coll=0, ent=20）。
+    """
+    w, h = 15, 9
+    coll = [0] * (w * h)
+    ent = [0] * (w * h)
+
+    def put(gx, gy, c, e=0):
+        coll[gy * w + gx] = c
+        ent[gy * w + gx] = e
+
+    for gx in range(w):
+        put(gx, 0, 4, 15)
+        put(gx, h - 1, 4, 15)
+    for gy in range(h):
+        put(0, gy, 4, 15)
+        put(w - 1, gy, 4, 15)
+    for gx, gy in ((w // 2, 0), (w // 2, h - 1), (0, h // 2), (w - 1, h // 2)):
+        put(gx, gy, 5, 16)                  # 门
+
+    pgx, pgy = plate
+    put(pgx, pgy, 0, 20)                    # 压力板
+    for dx, dy in DIRS8:
+        gx, gy = pgx + dx, pgy + dy
+        if (gx, gy) in tnt:
+            put(gx, gy, 3, 12)
+        elif (gx, gy) in bombable:
+            put(gx, gy, 3, 5)
+        else:
+            put(gx, gy, 3, 2)
+    return {
+        "w": w, "h": h, "cells": [0] * (w * h),
+        "coll": coll, "ent": ent,
+        "gv": 3, "ox": 20.0, "oy": 100.0, "tw": 40.0, "th": 40.0,
+    }
 
 
 def run_case(name, fn):
@@ -140,6 +190,55 @@ def main():
         assert abs(m[1]) > 0.7, f"右方来弹应该上下躲，实际 {a.move}"
         assert a.shoot == (0, 0), f"紧急躲弹不应开枪，实际 {a.shoot}"
         print(f"     动作 move={a.move} shoot={a.shoot}")
+
+    def t_lob_landing():
+        # 高抛弹：影子就在玩家脚下，height 从 -180 升到 -160（10/帧），
+        # 约 14 帧后落到普通命中高度。二维速度是 0，只能靠落点预警发现。
+        st1 = mk_state(grid, px, py, enemies=[{"x": px + 200, "y": py}],
+                       bullets=[{"x": px, "y": py, "height": -180.0}])
+        st1["frame"] = 10
+        ag = TacticalAgent()
+        ag.act(st1)
+        st2 = mk_state(grid, px, py, enemies=[{"x": px + 200, "y": py}],
+                       bullets=[{"x": px, "y": py, "height": -160.0}])
+        st2["frame"] = 12
+        a = ag.act(st2)
+        assert a.move != (0, 0), "高抛弹落点就在脚下，必须移动"
+        enemies, projectiles, _, hazards = split_entities(st2)
+        danger_here = ag._danger_at(px, py, 8, projectiles, enemies, hazards, ag.grid, 1.0)
+        danger_away = ag._danger_at(px + 120, py, 8, projectiles, enemies, hazards, ag.grid, 1.0)
+        assert danger_here > danger_away + 100, \
+            f"落点危险场没生效 {danger_here:.0f} vs {danger_away:.0f}"
+        print(f"     动作 move={a.move} 落点危险 {danger_here:.0f} vs {danger_away:.0f}")
+
+    def t_jump_up_warning():
+        # 实机 Monstro：JumpUp 约 0.4 秒后砸向玩家当前位置，动画名是唯一信号
+        st = mk_state(grid, px, py, enemies=[{
+            "x": px + 150, "y": py, "hp": 500, "boss": True,
+            "size": 42, "anim": "JumpUp"}])
+        ag = TacticalAgent()
+        a = ag.act(st)
+        m = _dir8_to_vec(*a.move)
+        assert a.mode == "jump_dodge", f"跳跃时应接管移动，实际 {a.mode}"
+        assert a.debug.get("threat", 0) >= 0.65, f"起跳威胁没触发 {a.debug.get('threat')}"
+        assert a.shoot == (0, 0), f"跳跃砸地时不该站桩开枪 {a.shoot}"
+        assert a.move != (0, 0), f"起跳就该横移 {a.move}"
+        assert m[0] < 0.1, f"不该往起跳的 BOSS 身上跑 {a.move}"
+        print(f"     动作 move={a.move} threat={a.debug.get('threat'):.2f} "
+              f"落点=({a.debug.get('jump_land')})")
+
+    def t_jump_down_landing():
+        # JumpDown：影子=Position，按速度前推；预警圈在落点上，AI 应往外走
+        st = mk_state(grid, px, py, enemies=[{
+            "x": px + 100, "y": py, "vx": -5.0, "hp": 500, "boss": True,
+            "size": 42, "anim": "JumpDown"}])
+        ag = TacticalAgent()
+        a = ag.act(st)
+        m = _dir8_to_vec(*a.move)
+        assert a.shoot == (0, 0), f"下落砸地时不应开枪 {a.shoot}"
+        assert a.move != (0, 0), "下落阶段必须离开落点"
+        assert m[0] < 0.3, f"不该迎着砸下来的 BOSS 走 {a.move}"
+        print(f"     动作 move={a.move} threat={a.debug.get('threat'):.2f}")
 
     def t_static_hazard():
         # 尖刺在 (5,6)，玩家在右边，目标格子设到尖刺左侧：A* 不该穿尖刺
@@ -317,11 +416,176 @@ def main():
             f"连通边反向错误 {ag.floor_edges}"
         print("     slot6 往右推，反向边 6<->4")
 
+    def t_keep_distance():
+        # 怪物贴到 60px：应该主动往后退，而不是继续贴脸
+        st = mk_state(grid, px, py, enemies=[{"x": px + 60, "y": py}])
+        ag = TacticalAgent()
+        a = ag.act(st)
+        m = _dir8_to_vec(*a.move)
+        assert m[0] < -0.5, f"贴脸时应后撤拉开距离，实际 {a.move}"
+        # 远距离（180px）不需要后撤
+        st2 = mk_state(grid, px, py, enemies=[{"x": px + 180, "y": py}])
+        a2 = TacticalAgent().act(st2)
+        m2 = _dir8_to_vec(*a2.move)
+        assert m2[0] > -0.5, f"中距离不应一直后退，实际 {a2.move}"
+        print(f"     近身 move={a.move}，180px move={a2.move}")
+
+    def t_plate_reachable():
+        g = json.loads(json.dumps(grid))
+        pgx, pgy = 7, 4
+        g["ent"][pgy * g["w"] + pgx] = 20
+        x, y = center(g, 4, 4)
+        ag = TacticalAgent()
+        a = ag.act(mk_state(g, x, y, clear=False))
+        assert a.mode == "plate", f"有可达压力板应去踩，实际 {a.mode}"
+        assert a.move != (0, 0), f"应朝压力板移动，实际 {a.move}"
+        # 站上压力板后原地等清房
+        bx, by = center(g, pgx, pgy)
+        a2 = ag.act(mk_state(g, bx, by, clear=False))
+        assert a2.mode == "plate" and a2.move == (0, 0), \
+            f"站在板上应原地等，实际 {a2.mode} {a2.move}"
+        print(f"     走板 move={a.move}，站板 {a2.mode}/{a2.move}")
+
+    def t_bomb_open_plate():
+        g = mech_grid()
+        x, y = center(g, 3, 4)
+        ag = TacticalAgent()
+        a = ag.act(mk_state(g, x, y, clear=False, bombs=3))
+        assert a.mode == "bomb", f"压力板不可达应去炸石头，实际 {a.mode}"
+        assert ag.bomb_target == 4 * g["w"] + 6, \
+            f"应选 (6,4) 炸弹石，实际 {ag.bomb_target}"
+        # 走到炸点后放下炸弹并往安全处撤
+        bx, by = center(g, 5, 4)
+        a2 = ag.act(mk_state(g, bx, by, clear=False, bombs=2))
+        assert a2.bomb, f"到炸点应放炸弹，实际 {a2.mode} bomb={a2.bomb}"
+        assert a2.move != (0, 0), "放完炸弹应撤离"
+        # 等爆炸期间不能重复放弹
+        a3 = ag.act(mk_state(g, bx, by, clear=False, bombs=2))
+        assert not a3.bomb and a3.mode == "bomb", \
+            f"等爆炸期间不应再放弹，实际 {a3.mode} bomb={a3.bomb}"
+        print(f"     规划 {a.mode} -> 放弹 {a2.bomb} 撤离 {a2.move} -> 等待 {a3.mode}")
+
+    def t_bomb_no_stock():
+        g = mech_grid()
+        x, y = center(g, 3, 4)
+        a = TacticalAgent().act(mk_state(g, x, y, clear=False, bombs=0))
+        assert a.mode == "plate-blocked", f"没炸弹应停在 plate-blocked，实际 {a.mode}"
+        assert not a.bomb, "没炸弹不能放"
+        print(f"     无库存 {a.mode}")
+
+    def t_bomb_prefers_rock_over_tnt():
+        g = mech_grid(bombable={(6, 4), (8, 4)}, tnt={(8, 4)})
+        x, y = center(g, 3, 4)
+        ag = TacticalAgent()
+        a = ag.act(mk_state(g, x, y, clear=False, bombs=3))
+        assert a.mode == "bomb", f"应规划炸路，实际 {a.mode}"
+        assert ag.bomb_target == 4 * g["w"] + 6, \
+            f"应优先普通炸弹石而非 TNT，实际 {ag.bomb_target}"
+        print(f"     TNT 在右，选择炸左侧石头 {ag.bomb_target}")
+
+    def t_bomb_escape_avoid_tnt():
+        # 炸点左侧有 TNT：撤离点不能贴着它
+        g = mech_grid(tnt={(5, 3), (4, 4), (5, 5)})
+        x, y = center(g, 5, 4)
+        ag = TacticalAgent()
+        ag.update_state(mk_state(g, x, y, clear=False, bombs=2))
+        esc = ag._bomb_escape_cell(mk_state(g, x, y)["player"], 4 * g["w"] + 6)
+        assert esc is not None, "应能找到撤离点"
+        ex, ey = ag.grid.center(esc)
+        bx, by = ag.grid.center(4 * g["w"] + 6)
+        assert math.hypot(ex - bx, ey - by) >= 3.0 * 40 - 1e-6, \
+            f"撤离点太近 {esc}"
+        assert not ag.grid.near_tnt(esc, 2.2), f"撤离点贴着 TNT {esc}"
+        print(f"     撤离格 {esc} 距爆点 {math.hypot(ex - bx, ey - by):.0f}px")
+
+    def t_bomb_full_sequence():
+        # 完整走一遍：规划→放弹→撤离→等爆炸→石头消失→踩板→清房
+        g = mech_grid()
+        ag = TacticalAgent()
+        gx, gy = center(g, 3, 4)
+
+        def mk(px, py, gg=g, bombs=2):
+            return mk_state(gg, px, py, clear=False, bombs=bombs)
+
+        a = ag.act(mk(gx, gy, bombs=3))
+        assert a.mode == "bomb" and ag.bomb_spot is not None
+        bx, by = center(g, 5, 4)
+        a2 = ag.act(mk(bx, by, bombs=3))
+        assert a2.bomb and ag.bomb_escape is not None
+        ex, ey = ag.grid.center(ag.bomb_escape)
+        for _ in range(120):
+            ag.act(mk(ex, ey))
+        assert ag.bomb_target is None and not ag.bomb_dropped, \
+            f"爆炸后没清账 target={ag.bomb_target}"
+
+        g2 = json.loads(json.dumps(g))
+        g2["coll"][4 * g2["w"] + 6] = 0
+        g2["ent"][4 * g2["w"] + 6] = 0
+        a3 = ag.act(mk(ex, ey, gg=g2))
+        assert a3.mode == "plate", f"路炸开后应去踩板，实际 {a3.mode}"
+        pxp, pyp = center(g2, 7, 4)
+        a4 = ag.act(mk(pxp, pyp, gg=g2))
+        assert a4.mode == "plate" and a4.move == (0, 0), \
+            f"站上板应等清房，实际 {a4.mode} {a4.move}"
+        print(f"     规划→放弹→撤离→清账→踩板 全流程通过")
+
+    def t_explore_via_seen_door():
+        # 实机地图：84 的下方是 97，97 的下门通往未探索的 110。
+        # 即使 97→110 还没走过，只要在 97 见过下门开着，就应该规划过去。
+        ag = TacticalAgent()
+        ag.room_index = 84
+        ag.doors = [{"slot": 0, "grid": 60, "open": True},
+                    {"slot": 2, "grid": 74, "open": True},
+                    {"slot": 3, "grid": 127, "open": True}]
+        ag.map_rooms = [
+            {"grid": 84, "type": 1, "visited": 17},
+            {"grid": 83, "type": 1, "visited": 18},
+            {"grid": 85, "type": 1, "visited": 2},
+            {"grid": 97, "type": 1, "visited": 1},
+            {"grid": 110, "type": 1, "visited": 0},
+            {"grid": 112, "type": 5, "visited": 0},
+        ]
+        ag.visited_rooms = {84, 83, 85, 97}
+        ag.seen_door_slots = {84: {0, 2, 3}, 97: {1, 3}, 85: {0, 3}}
+        ag.floor_edges = {84: {0: 83, 2: 85, 3: 97},
+                          83: {2: 84}, 85: {0: 84}, 97: {1: 84}}
+        step = ag._nearest_unvisited_step()
+        assert step == 97, f"应经 97 去 110，实际第一跳 {step}"
+        d = ag.choose_door()
+        assert d and d["slot"] == 3, f"应走 84 下门，实际 {d}"
+
+        # 没见过的门不能凭空推断（85 的上门锁着，72 不能从 85 进）
+        edges = ag._known_edges()
+        assert 1 not in edges.get(85, {}), f"85 上锁的门被误当成通路: {edges.get(85)}"
+        print(f"     第一跳 97 -> 110，84 选下门；未见的 85 上门未连通")
+
+    def t_no_pingpong_prev_room():
+        # 两个邻居都去过、都没有其它未探索出口：不要立刻回到刚出来的房间
+        ag = TacticalAgent()
+        ag.room_index = 84
+        ag.prev_room = 83
+        ag.doors = [{"slot": 0, "grid": 60, "open": True},
+                    {"slot": 2, "grid": 74, "open": True}]
+        ag.map_rooms = [
+            {"grid": 84, "type": 1, "visited": 8},
+            {"grid": 83, "type": 1, "visited": 1},   # 刚出来、显得“去得少”
+            {"grid": 85, "type": 1, "visited": 9},
+        ]
+        ag.visited_rooms = {84, 83, 85}
+        ag.seen_door_slots = {84: {0, 2}, 83: {2}, 85: {0}}
+        ag.floor_edges = {84: {0: 83, 2: 85}, 83: {2: 84}, 85: {0: 84}}
+        d = ag.choose_door()
+        assert d and d["slot"] == 2, f"应避开刚出来的 83，实际 {d}"
+        print(f"     prev_room=83 时改走 85")
+
     ok.append(run_case("静止敌人：开火且方向正确", t_stationary))
     ok.append(run_case("斜向敌人：未对齐不开火", t_diagonal_gate))
     ok.append(run_case("移动敌人：不能站桩直射", t_lead_move))
     ok.append(run_case("石头挡视线：不开火", t_wall))
     ok.append(run_case("弹幕来袭：横移躲避且停火", t_dodge))
+    ok.append(run_case("高抛弹幕：按落点躲避", t_lob_landing))
+    ok.append(run_case("BOSS 起跳：提前离开落点", t_jump_up_warning))
+    ok.append(run_case("BOSS 下落：不迎着落点走", t_jump_down_landing))
     ok.append(run_case("A* 绕开尖刺", t_static_hazard))
     ok.append(run_case("清房先拾取再开门", t_pickup_then_door))
     ok.append(run_case("清房后按地图开门", t_door_explore))
@@ -332,6 +596,15 @@ def main():
     ok.append(run_case("沿已知连通图去 Boss 房", t_door_route_boss_edges))
     ok.append(run_case("回访有未走门的房间补图", t_door_frontier_route))
     ok.append(run_case("大房间第二扇门 slot4-7", t_second_door_slot))
+    ok.append(run_case("近身主动拉开距离", t_keep_distance))
+    ok.append(run_case("可达压力板：走过去踩", t_plate_reachable))
+    ok.append(run_case("压力板被围：炸弹石开路", t_bomb_open_plate))
+    ok.append(run_case("没炸弹时报告 plate-blocked", t_bomb_no_stock))
+    ok.append(run_case("炸弹石优先于 TNT", t_bomb_prefers_rock_over_tnt))
+    ok.append(run_case("撤离点避开 TNT", t_bomb_escape_avoid_tnt))
+    ok.append(run_case("机关房炸弹开路全流程", t_bomb_full_sequence))
+    ok.append(run_case("用见过的开门的门探索未访问房", t_explore_via_seen_door))
+    ok.append(run_case("清房后不立刻折返上一间", t_no_pingpong_prev_room))
 
     # 真实帧回放：每帧只做决策，检查不抛异常 + 统计开火倾向
     print("\n真实帧回放 (frames.json) ...")

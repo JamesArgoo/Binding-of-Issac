@@ -122,6 +122,7 @@ class Runner:
         self.deaths = 0
         self.shot_frames = 0
         self.shot_bursts = 0
+        self.bombs_used = 0
         self.hit_events = 0
         self.rooms_seen = set()
 
@@ -251,6 +252,12 @@ class Runner:
 
         self.ctrl.set_move(*a.move)
         self.ctrl.set_shoot(*a.shoot)
+        if getattr(a, "bomb", False):
+            try:
+                self.ctrl.tap_bomb()
+                self.bombs_used += 1
+            except AttributeError:
+                pass
         # 换房那一帧的 keydown 可能被游戏丢掉，周期性补发（否则会"假按着"）
         try:
             self.ctrl.refresh()
@@ -303,7 +310,8 @@ class Runner:
         mins = max(1e-6, (time.time() - self.started) / 60.0)
         return (f"实例{self.index}: 清房 {self.rooms_cleared}，击杀≈{self.kills}，"
                 f"受伤 {self.damage_taken:.0f}，输出≈{self.damage_dealt:.0f}，"
-                f"死亡 {self.deaths}，开火 {self.shot_bursts} 次/"
+                f"死亡 {self.deaths}，炸弹 {self.bombs_used}，"
+                f"开火 {self.shot_bursts} 次/"
                 f"{self.shot_frames} 决策帧，经过 {len(self.rooms_seen)} 个房间"
                 f"（{mins:.1f} 分钟）")
 

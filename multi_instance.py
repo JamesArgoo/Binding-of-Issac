@@ -55,6 +55,7 @@ user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 VK_MAP = {
     "w": (0x57, False), "a": (0x41, False), "s": (0x53, False), "d": (0x44, False),
     "up": (0x26, True), "down": (0x28, True), "left": (0x25, True), "right": (0x27, True),
+    "e": (0x45, False),          # 默认炸弹键
 }
 
 
@@ -195,6 +196,16 @@ class Win32KeyController:
         elif ay < 0:
             want.add("up")
         self._shoot = self._apply(self._shoot, want)
+
+    def tap(self, key, hold=0.05):
+        """短按一次（炸弹/主动道具这类一次性动作不能按住不放）。"""
+        self._post(key, True)
+        time.sleep(hold)
+        self._post(key, False)
+        return True
+
+    def tap_bomb(self):
+        return self.tap("e")
 
     def release_all(self):
         for k in list(self._move) + list(self._shoot):

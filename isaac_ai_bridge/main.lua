@@ -125,6 +125,27 @@ local function poll_commands()
                 pcall(function() Isaac.ExecuteCommand("restart") end)
             elseif line:sub(1, 5) == "goto " then
                 pcall(function() Isaac.ExecuteCommand("goto " .. line:sub(6)) end)
+            elseif line:sub(1, 6) == "spawn " then
+                -- 诊断用：在玩家右侧生成实体，便于离线复现跳跃 BOSS / 高抛弹幕。
+                -- spawn <type> <variant> <subtype>
+                local a, b, c = line:match("^spawn%s+(%d+)%s*(%d*)%s*(%d*)")
+                if a then
+                    pcall(function()
+                        local pl = Isaac.GetPlayer(0)
+                        local rm = game:GetRoom()
+                        local pos = pl.Position + Vector(140, 0)
+                        if not rm:IsPositionInRoom(pos, 20) then
+                            pos = rm:GetCenter()
+                        end
+                        local ent = Isaac.Spawn(tonumber(a), tonumber(b) or 0,
+                                                tonumber(c) or 0, pos, Vector.Zero, nil)
+                        -- 在已清空的房间里生成敌人时，房间不会自动变回战斗状态；
+                        -- 诊断脚本要靠 clear=false 才会进入战斗逻辑。
+                        if ent and (ent:IsEnemy() or ent:IsBoss()) then
+                            rm:SetClear(false)
+                        end
+                    end)
+                end
             elseif line:sub(1, 5) == "exec " then
                 pcall(function() Isaac.ExecuteCommand(line:sub(6)) end)
             end
@@ -147,6 +168,14 @@ local function build_entities(room)
         if e and e:Exists() then
             local t = e.Type
             if not (SKIP_EFFECT and t == 1000) then      -- 特效：纯视觉，丢掉
+                -- 跳跃 BOSS（Monstro）没有 Height 字段，但游戏用 SpriteOffset.Y
+                -- 把它画到空中；影子/落点仍在 Position。高抛弹幕则看 Height。
+                local offy = 0
+                pcall(function() offy = e.SpriteOffset.Y or 0 end)
+                local anim = nil
+                if e:IsBoss() then
+                    pcall(function() anim = e:GetSprite():GetAnimation() end)
+                end
                 out[#out + 1] = {
                     id = e.Index,
                     type = t,
@@ -162,7 +191,14 @@ local function build_entities(room)
                     spawner_type = e.SpawnerType or 0,
                     grid_idx = room:GetGridIndex(e.Position),
                     size = r1(e.Size),               -- 碰撞体积（半径）
-                    height = r1(e.Height or 0),      -- 泪弹高度（Z），非泪弹为 0
+                    height = r1(e.Height or 0),      -- 弹幕高度：负数在空中，-23 是普通泪弹
+                    fall_speed = r1(e.FallingSpeed or 0),
+                    fall_accel = r1(e.FallingAcceleration or 0),
+                    sprite_off_y = r1(offy),
+                    flying = e:IsFlying() and 1 or 0,
+                    visible = e:IsVisible() and 1 or 0,
+                    invincible = e:IsInvincible() and 1 or 0,
+                    anim = anim,
                     coll = e.CollisionClass or 0,    -- 碰撞类别（EntityCollisionClass）
                     cdmg = e.CollisionDamage or 0,   -- 接触伤害（>0 表示站上去会掉血）
                 }
