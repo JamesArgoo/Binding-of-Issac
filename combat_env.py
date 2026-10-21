@@ -337,7 +337,12 @@ class CombatEnv(gym.Env):
         elif self.reset_mode == "auto":
             p = (s or {}).get("player") or {}
             hp_now = float(p.get("hp", 0) or 0) + float(p.get("soul_hp", 0) or 0)
-            if hp_now < self.min_hp:
+            # 这里必须是 <=，不能是 <：以撒的血量是**半颗心**为单位的整数，
+            # 3/6 是个极常见的落点。用严格 < 时 hp 恰好在 3 就永远不重开，
+            # 于是血量卡死、每回合都在濒死状态开始 ——
+            # 实测会把一个回合变成"0 发弹、0 伤害、受伤 4.6"的废回合，
+            # 而且这个"废回合"会污染命中率/清房率这类汇总指标。
+            if hp_now <= self.min_hp:
                 need_restart = True
         if need_restart:
             self._cmd("restart")
